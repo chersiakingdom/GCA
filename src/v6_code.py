@@ -265,11 +265,53 @@ class Buckets:
 # ----------------------------------------------------------------------------
 # 변환 모델: y = A x + b + Σ_level u_level(x)   (x: R1 µm, y: R2 µm)
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 뇌 좌표계: 각 라운드의 점을 "그 뇌 자신의" 좌표로 변환 (원점 = 뇌 중심, 축 = 뇌의 주축)
+#   x' = (x - c) · E      (c: 중심, E: 주축 3개. 원래 영상 축에 가장 가까운 순서/방향으로 맞춤)
+#   회전·이동만 하므로 세포 사이 거리와 이웃 관계는 그대로 유지됨 (크기 정규화는 하지 않음: µm 유지)
+# ----------------------------------------------------------------------------
+class BrainFrame:
+    def __init__(self, c, E):
+        self.c = np.asarray(c, np.float64); self.E = np.asarray(E, np.float64)
+
+    @classmethod
+    def fit(cls, P_um, n=20_000_000, seed=0):
+        rng = np.random.default_rng(seed)
+        S = P_um[rng.integers(0, len(P_um), min(n, len(P_um)))].astype(np.float64)
+        lo, hi = np.percentile(S, 0.5, axis=0), np.percentile(S, 99.5, axis=0)
+        S = S[np.all((S >= lo) & (S <= hi), axis=1)]          # 뇌 밖 이상점 제외
+        c = S.mean(0)
+        _, V = np.linalg.eigh(np.cov((S - c).T))
+        best, bt = None, -np.inf
+        for perm in itertools.permutations(range(3)):          # 영상 축에 가장 가까운 순서·부호 선택
+            for sg in itertools.product((1.0, -1.0), repeat=3):
+                E = V[:, perm] * np.array(sg)
+                if np.linalg.det(E) > 0 and np.trace(E) > bt:
+                    best, bt = E, np.trace(E)
+        return cls(c, best)
+
+    def to(self, X):
+        return ((np.asarray(X, np.float64) - self.c) @ self.E).astype(np.float32)
+
+    def back(self, Xp):
+        return np.asarray(Xp, np.float64) @ self.E.T + self.c
+
+    def tilt_deg(self):
+        return float(np.rad2deg(np.arccos(np.clip(abs(self.E[2, 2]), -1, 1))))
+
+
 class Warp:
     def __init__(self, A=None, b=None):
         self.A = np.eye(3) if A is None else np.asarray(A, float)
         self.b = np.zeros(3) if b is None else np.asarray(b, float)
         self.levels = []   # dict(origin(3), step, U(nx,ny,nz,3) float32)
+        self.base = None   # (원래 좌표계 Warp, BrainFrame R1, BrainFrame R2): 이전 실행 변형장을 뇌 좌표계에서 재사용
+        self.base_path = None
+
+    @classmethod
+    def from_raw(cls, path, f1, f2):
+        """원래 좌표계(µm)에서 만든 변형장(예: v5 warp_final.npz)을 뇌 좌표계에서 쓰도록 감쌈."""
+        w = cls(); w.base = (Warp.load(path), f1, f2); w.base_path = str(path); return w
 
     def copy(self):
         w = Warp(self.A.copy(), self.b.copy()); w.levels = [dict(L) for L in self.levels]; return w
@@ -279,7 +321,11 @@ class Warp:
         out = np.empty((len(X), 3), np.float32)
         for s in range(0, len(X), chunk):
             x = X[s:s + chunk].astype(np.float64)
-            y = x @ self.A.T + self.b
+            if self.base is not None:
+                inner, f1, f2 = self.base
+                y = f2.to(inner.apply(f1.back(x))).astype(np.float64)
+            else:
+                y = x @ self.A.T + self.b
             for L in self.levels:
                 g = ((x - L["origin"]) / L["step"]).T
                 for c in range(3):
@@ -289,6 +335,9 @@ class Warp:
 
     def save(self, path):
         d = dict(A=self.A, b=self.b, n_levels=len(self.levels))
+        if self.base is not None:
+            _, f1, f2 = self.base
+            d.update(base_path=str(self.base_path), f1_c=f1.c, f1_E=f1.E, f2_c=f2.c, f2_E=f2.E)
         for i, L in enumerate(self.levels):
             d[f"L{i}_origin"] = L["origin"]; d[f"L{i}_step"] = L["step"]; d[f"L{i}_U"] = L["U"]
         np.savez_compressed(path, **d)
@@ -297,6 +346,9 @@ class Warp:
     def load(cls, path):
         f = np.load(path)
         w = cls(f["A"], f["b"])
+        if "base_path" in f:
+            w.base = (Warp.load(str(f["base_path"])), BrainFrame(f["f1_c"], f["f1_E"]), BrainFrame(f["f2_c"], f["f2_E"]))
+            w.base_path = str(f["base_path"])
         for i in range(int(f["n_levels"])):
             w.levels.append(dict(origin=f[f"L{i}_origin"], step=float(f[f"L{i}_step"]), U=f[f"L{i}_U"]))
         return w
@@ -1242,6 +1294,7 @@ def run(cfg):
     CFG.update(cfg)
     in_keys = ["R1_JSON", "R2_JSON", "SPACING_R1_XYZ_UM", "SPACING_R2_XYZ_UM", "COORD_ORDER", "R1_Z_RANGE",
                "QUICK_CTX_SLICES", "R2_EXTRA_SLICES", "BUCKET_UM"]
+    in_keys = in_keys + ["BRAIN_FRAME"]
     reg_keys = in_keys + (["INIT_WARP"] if cfg.get("INIT_WARP") else
                           ["GLOBAL_BINS_UM", "LEVELS", "ALLOW_REFLECTION", "INITIAL_AFFINE"])
     run_dir = Path(cfg["OUT_ROOT"]) / f"run_{_sig(cfg, reg_keys)}"
@@ -1270,7 +1323,20 @@ def run(cfg):
         log(f"  빠른 테스트: 출력 R1 z[{z0},{z1}) {core_mask.sum():,}점, 정합 문맥 {len(sel1):,}점, R2 후보 {len(sel2):,}점")
     else:
         sel2 = np.arange(len(V2))
-    P1 = (V1[sel1] * sp1).astype(np.float32); P2 = (V2[sel2] * sp2).astype(np.float32)
+    if cfg["BRAIN_FRAME"]:
+        # 각 라운드를 그 뇌 자신의 좌표계로 변환 (전체 점으로 중심·주축 계산; 빠른 테스트여도 전체 기준)
+        f1 = BrainFrame.fit(V1 * sp1); f2 = BrainFrame.fit(V2 * sp2)
+        rel = f1.E.T @ f2.E
+        rel_deg = float(np.rad2deg(np.arccos(np.clip((np.trace(rel) - 1) / 2, -1, 1))))
+        log(f"  뇌 좌표계 변환: R1 중심 {np.round(f1.c, 0).tolist()} µm, 주축 z 기울기 {f1.tilt_deg():.2f}° | "
+            f"R2 중심 {np.round(f2.c, 0).tolist()} µm, 주축 z 기울기 {f2.tilt_deg():.2f}°")
+        log(f"    두 라운드 뇌 축 사이 회전 차이 {rel_deg:.2f}°, 중심 차이 {np.round(f2.c - f1.c, 1).tolist()} µm "
+            f"(이후 정렬은 x′,y′,z′ 좌표에서 이 차이를 더 정밀하게 맞춤)")
+        np.savez(run_dir / "brain_frames.npz", r1_center_um=f1.c, r1_axes=f1.E, r2_center_um=f2.c, r2_axes=f2.E)
+        P1 = f1.to(V1[sel1] * sp1); P2 = f2.to(V2[sel2] * sp2)
+    else:
+        f1 = f2 = None
+        P1 = (V1[sel1] * sp1).astype(np.float32); P2 = (V2[sel2] * sp2).astype(np.float32)
     log("  공간 인덱스 생성 중...")
     B1 = Buckets(P1, cfg["BUCKET_UM"]); B2 = Buckets(P2, cfg["BUCKET_UM"])
     del P1, P2; gc.collect()
@@ -1281,8 +1347,8 @@ def run(cfg):
     if cfg.get("INIT_WARP"):
         # ---- 이전 실행(v5 등)의 변형장을 출발점으로 사용: 1~3단계 생략 ----
         stage("1-3/6 이전 변형장 재사용 (INIT_WARP)")
-        warp = Warp.load(cfg["INIT_WARP"])
-        log(f"  {cfg['INIT_WARP']} (affine + 변형 {len(warp.levels)}단계)")
+        warp = Warp.from_raw(cfg["INIT_WARP"], f1, f2) if f1 is not None else Warp.load(cfg["INIT_WARP"])
+        log(f"  {cfg['INIT_WARP']} (원래 좌표계 변형장을 뇌 좌표계로 감싸서 사용)" if f1 is not None else f"  {cfg['INIT_WARP']}")
         report["init_warp"] = cfg["INIT_WARP"]
     else:
         # ---------------- 1. 전역 affine ----------------
@@ -1365,7 +1431,7 @@ def run(cfg):
         log(f"  hold-out 검증 ({len(he):,}개 관측 세포를 가리고 주변으로 맞힘): 오차 중앙값 {np.median(he):.2f} µm, "
             f"p90 {np.percentile(he, 90):.2f} µm, {cfg['HOLDOUT_OK_UM']:g} µm 이내 {100*(he < cfg['HOLDOUT_OK_UM']).mean():.1f}% "
             f"(z 성분 중앙값 {np.median(C['ho_err_z']):.2f} µm; 국소 보정 없이 변형장만: 중앙값 {np.median(hw):.2f} µm)")
-        save_holdout_map(C["ho_x"], he, run_dir / "holdout_error_map.png", thr=cfg["HOLDOUT_OK_UM"])
+        save_holdout_map(C["ho_x"], he, run_dir / "holdout_error_map.png", thr=cfg["HOLDOUT_OK_UM"])   # 축: 뇌 좌표계
 
     # 정렬 순서 → 원래 순서
     inv1 = B1.order
@@ -1395,7 +1461,10 @@ def run(cfg):
     rows[ob] = F2.raw[m2_o[out_idx][ob]]
     im = ~ob
     rows[im] = F1.raw[r1_rows[im]] if F1.ncol == F2.ncol else 0
-    vox_imp = pos_o[out_idx][im].astype(np.float64) / sp2
+    pos_imp = pos_o[out_idx][im].astype(np.float64)
+    if f2 is not None:
+        pos_imp = f2.back(pos_imp)          # 뇌 좌표계 → R2 원래 좌표(µm)
+    vox_imp = pos_imp / sp2
     for a in range(3):
         rows[im, c2[a]] = vox_imp[:, a]
     final_json = run_dir / "R2_canonical_matched_to_R1.json"
@@ -1439,7 +1508,19 @@ def run(cfg):
     log(f"완료. R1 {len(out_idx):,}행 = 최종 R2 {len(rows):,}행. 보고서: {run_dir/'report.json'}")
     return dict(report=report, run_dir=run_dir, r1_xyz_vox=V1[r1_rows], r2_xyz_vox=r2_vox,
                 status=status[out_idx], r2_unmatched_vox=V2[unused2] if len(unused2) else np.empty((0, 3)),
-                confidence=conf_o[out_idx], uncertainty=unc_o[out_idx], warp=warp)
+                confidence=conf_o[out_idx], uncertainty=unc_o[out_idx], warp=RawWarp(warp, f1, f2),
+                warp_brain_frame=warp, frames=(f1, f2))
+
+
+class RawWarp:
+    """원래 좌표계용 인터페이스: R1 µm(원래 좌표) → R2 µm(원래 좌표). 진단/다른 채널 점 변환에 사용."""
+    def __init__(self, warp, f1, f2):
+        self.warp, self.f1, self.f2 = warp, f1, f2
+
+    def apply(self, X):
+        if self.f1 is None:
+            return self.warp.apply(X)
+        return self.f2.back(self.warp.apply(self.f1.to(X))).astype(np.float32)
 
 
 def _unsort(a_sorted, order):

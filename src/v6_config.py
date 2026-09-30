@@ -19,6 +19,9 @@ CFG = dict(
     QUICK_CTX_SLICES=250,
     R2_EXTRA_SLICES=300,
 
+    # --- 뇌 좌표계 변환 (정렬 전에 각 라운드를 뇌 중심·뇌 주축 기준 x′,y′,z′로 바꿈) ---
+    BRAIN_FRAME=True,
+
     # --- 이전 실행의 변형장 재사용 (1~3단계 생략, 약 1시간 절약) ---
     # v5 결과를 출발점으로: R2_ROOT + "/source/syto16_R1_canonical_v5/run_799cd3c8930d/warp_final.npz"
     # 처음부터 다시 하려면 None
