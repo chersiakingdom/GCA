@@ -45,11 +45,39 @@ Figure 1 코드들과 동일합니다.
 
 ---
 
+## 전처리는 Figure 1 분석 코드와 동일합니다
+
+reinjection CSV 는 Figure 1 분석 코드(`run_analysis`)의
+`load_one_csv` / `merge_levels` / `load_count_family` 와 같은 규칙으로
+읽습니다.
+
+- column: `id`, `region`, `count`, `area`
+- `ex_co/results` → `results_cocheck` → `results` 우선순위로 폴더 선택
+- whole/rh × lvl1~7 (행이 없는 level 파일은 건너뛰고 그 사실을 출력)
+- 여러 level 에 같은 ID 가 있으면 값이 일치할 때만 1회 사용
+- `lh = whole − rh`, 음수는 허용 오차 밖이면 중단
+
+feature 는 **새로 정의하지 않고 Figure 1 run 의 것을 그대로 읽어
+reinjection 에 적용**합니다.
+
+- `primary/Predefined/Motor/feature_definitions.csv` + `p.csv`
+- `primary/AllGrayMatter/Motor/feature_definitions.csv` + `p.csv`
+- `source_specificity/shared_feature_definitions.csv` +
+  `p_shared_feature_space.csv`
+
+즉 `parent − nearest included descendants` residual, source 제외,
+zero-volume feature 제외가 모두 Figure 1 과 동일하게 적용되며,
+AAV-Cre 쪽 p 는 Figure 1 이 계산해 둔 값을 그대로 씁니다.
+reinjection 은 같은 정의로 count/area 를 만들어
+`p = (count/area) / Σ(count/area)` 로 normalize 합니다
+(Eq6 의 배율과 denominator 는 p 에서 상쇄됩니다).
+
+---
+
 ## 입력
 
-- reinjection: 각 path 의
-  `source/results/tdt_total_cell_count_{rh,whole}_lvl{1..7}.csv`
-  (`lh = whole − rh`, lvl1~7 을 합친 뒤 region id 로 중복 제거)
+- reinjection: 각 path 아래
+  `source/results/tdt_total_cell_count_{whole,rh}_lvl{1..7}.csv`
 - AAV-Cre M1: 기존 Figure 1 run 폴더의
   `config.json`, `RUN_STATUS.json`, `input_manifest.csv`,
   `raw_readout_regions.csv`, `off_source_counts.csv`,
@@ -90,22 +118,17 @@ left / right 를 합치지 않고 각각 독립 feature 로 유지합니다.
 | `Reinj_reference_density_model.svg` | reference density 가 reinjection count 를 예측하는지 (NB2, hemisphere 포함) | 5-C |
 | `Reinj_QC_signal_coverage_laterality.svg` | 절대 signal, coverage, 분포 집중도, laterality | 5 Step 0, IV-2 |
 
-Scope 는 `PredefinedM1` / `Predefined20` / `AllGrayMatter` 세 가지입니다.
-source-specificity 에서는 region 자체가 M1 에서 정의된 `PredefinedM1` 을
-circularity 때문에 제외합니다.
+Scope 는 Figure 1 run 의 `Predefined` 와 `AllGrayMatter` 이며,
+source-specificity 는 네 source 의 union 을 공통 제외한
+`source_specificity/` feature space 를 사용합니다.
 
 ---
 
 ## 그 밖의 처리 원칙
 
-- **Normalization**: mouse 별 `count / area` 를 sum = 1 로 normalize.
-  Eq6 의 off-source denominator 는 한 mouse 안에서 상수라 p 에서
-  소거되므로 두 dataset 의 area 단위가 달라도 영향이 없습니다.
-  절대 cell 수는 QC figure 에서 따로 다룹니다(IV-2).
-- **Source region**: 네 source 의 union(및 descendant)을 양쪽에서 동일하게
-  제외합니다(3번, cf Step 1).
-- **Parent-child overlap**: broad pool 은 자신의 descendant 가 pool 에 함께
-  있지 않은 region 만 남겨 구성합니다(2번).
+- **Normalization / source 제외 / parent-child overlap**: 모두 Figure 1
+  feature 정의를 그대로 따릅니다(위 참조).
+- **절대 cell 수**는 pattern 과 분리해 QC figure 에서 다룹니다(IV-2).
 - **Permutation**: p-value 는 "major division 과 region volume 만 맞춘
   random region set 보다 집중이 높은가"에 대한 값이며, biological
   replicate 수준의 동일성을 뜻하지 않습니다(10번, IV-4).

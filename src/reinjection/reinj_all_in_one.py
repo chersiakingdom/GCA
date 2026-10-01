@@ -32,6 +32,7 @@
 
 from pathlib import Path
 from itertools import combinations
+import ast
 import json
 import re
 import traceback
@@ -132,11 +133,35 @@ ORIENTATION = "rh_to_ipsi"
 # 5. region set
 # ------------------------------------------------------------
 
+# Figure 1 분석(run_analysis)이 만들어 둔 feature space 를 그대로 씁니다.
+#   primary/Predefined/Motor/
+#   primary/AllGrayMatter/Motor/
+#
+# region 을 새로 고르거나 residual 을 다시 정의하지 않습니다.
+
 SCOPES = [
-    "PredefinedM1",     # Figure 1 에서 M1 의 recipient 로 정의된 region
-    "Predefined20",     # Figure 1 predefined recipient region 20개 전체
-    "AllGrayMatter",    # Figure 1 broad region set
+    "Predefined",
+    "AllGrayMatter",
 ]
+
+
+# ------------------------------------------------------------
+# 5-1. reinjection CSV prefix / 폴더 규칙
+#
+# Figure 1 코드의 resolve_inputs 와 같은 우선순위를 씁니다.
+#   ex_co/results  ->  results_cocheck  ->  results
+# ------------------------------------------------------------
+
+REINJ_PREFIX = "tdt_total_cell_count"
+
+RESULTS_RULES = [
+    "ex_co/results",
+    "results_cocheck",
+    "results",
+]
+
+# 위 규칙을 적용할 기준 폴더 (root 아래에서 차례로 시도)
+RESULTS_BASES = ["source", ""]
 
 
 # ------------------------------------------------------------
@@ -164,11 +189,7 @@ NEGATIVE_COUNT_TOL = 0.5
 
 LEVELS = [1, 2, 3, 4, 5, 6, 7]
 
-RESULTS_SUBDIR = "source/results"
-
-RH_FILE_TEMPLATE = "tdt_total_cell_count_rh_lvl{level}.csv"
-
-WHOLE_FILE_TEMPLATE = "tdt_total_cell_count_whole_lvl{level}.csv"
+FILE_TEMPLATE = "{prefix}_{hemi}_lvl{level}.csv"
 
 
 # ============================================================
@@ -201,8 +222,7 @@ GROUP_LABEL = {
 }
 
 SCOPE_LABEL = {
-    "PredefinedM1": "M1 predefined recipient regions",
-    "Predefined20": "Predefined 20 regions",
+    "Predefined": "Predefined recipient regions (M1)",
     "AllGrayMatter": "All gray matter",
 }
 
@@ -410,176 +430,283 @@ def detect_column(frame, base, role, where, side=None, required=True):
 
 # ============================================================
 # reinjection lvl1~7 읽기
+#
+# Figure 1 분석 코드(run_analysis)의 load_one_csv / merge_levels /
+# load_count_family 와 같은 규칙을 사용합니다.
+#
+#   - column: id, region, count, area
+#   - 14개 파일 (whole/rh × lvl1~7) 모두 필요
+#   - 여러 level 에 같은 ID 가 있으면 값이 같을 때만 1회 사용
+#   - lh = whole - rh
 # ============================================================
 
-def _read_level_file(path, side):
+def reinj_results_directory(root):
+    """
+    Figure 1 코드의 resolve_inputs 와 같은 우선순위로 results 폴더를
+    찾습니다: ex_co/results -> results_cocheck -> results
+    """
 
-    require(path.is_file(), f"파일을 찾을 수 없습니다:\n{path}")
+    root = Path(root).expanduser()
 
-    frame = pd.read_csv(path)
+    tried = []
 
-    frame.columns = [str(col).strip() for col in frame.columns]
+    for base in RESULTS_BASES:
 
-    where = f"파일: {path}"
+        parent = root / base if base else root
 
-    id_col = detect_column(frame, "id", "region id", where)
-    count_col = detect_column(frame, "count", "cell count", where, side)
-    area_col = detect_column(frame, "area", "region area", where, side)
+        for rule in RESULTS_RULES:
 
-    acronym_col = detect_column(
-        frame, "acronym", "acronym", where, required=False
-    )
+            directory = parent / rule
 
-    name_col = detect_column(
-        frame, "name", "region name", where, required=False
-    )
+            tried.append(directory)
 
-    out = pd.DataFrame({
-        "id": pd.to_numeric(frame[id_col], errors="coerce"),
-        "count": pd.to_numeric(frame[count_col], errors="coerce"),
-        "area": pd.to_numeric(frame[area_col], errors="coerce"),
-    })
+            if directory.is_dir():
+                return directory, tried
 
-    out["acronym"] = (
-        frame[acronym_col].astype(str) if acronym_col is not None else ""
-    )
+    return None, tried
 
-    out["name"] = (
-        frame[name_col].astype(str) if name_col is not None else ""
-    )
 
-    out = out.loc[out["id"].notna()].copy()
+def load_one_csv(path, allow_empty=False):
+    """
+    Figure 1 코드의 load_one_csv 와 같은 검사.
 
-    out["id"] = out["id"].astype(int)
+    allow_empty=True 면 행이 없는 level 파일은 건너뜁니다
+    (값을 만들어 넣지는 않습니다).
+    """
+
+    frame = pd.read_csv(path, encoding="utf-8-sig")
+
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
 
     require(
-        out["count"].notna().all() and out["area"].notna().all(),
-        f"{where}\ncount 또는 area 에 숫자가 아닌 값이 있습니다."
+        not frame.columns.duplicated().any(),
+        f"{path}: 중복 column 이름"
     )
 
-    return out
+    require(
+        {"id", "region", "count", "area"}.issubset(frame.columns),
+        f"{path}: id, region, count, area column 이 필요합니다.\n"
+        f"실제 column: {list(frame.columns)}"
+    )
 
+    if len(frame) == 0:
 
-def _combine_levels(root, template, side, label):
+        require(allow_empty, f"{path}: 비어 있는 CSV")
 
-    results = Path(root).expanduser() / RESULTS_SUBDIR
+        return frame.assign(
+            id=pd.Series(dtype="int64"),
+            count=pd.Series(dtype=float),
+            area=pd.Series(dtype=float),
+            region=pd.Series(dtype=object),
+        )[["id", "region", "count", "area"]]
 
-    frames = []
+    for column in ("id", "count", "area"):
 
-    for level in LEVELS:
+        frame[column] = pd.to_numeric(frame[column], errors="raise")
 
-        frame = _read_level_file(
-            results / template.format(level=level), side
+        require(
+            np.isfinite(frame[column]).all(),
+            f"{path}: {column} 에 결측/무한값"
         )
+
+    require(
+        np.equal(frame.id, np.floor(frame.id)).all(),
+        f"{path}: 정수가 아닌 ID"
+    )
+
+    frame["id"] = frame.id.astype("int64")
+
+    require(
+        not frame.id.duplicated().any(),
+        f"{path}: 한 CSV 안에서 ID 중복"
+    )
+
+    require(frame.region.notna().all(), f"{path}: region 이름 누락")
+
+    frame["region"] = frame.region.astype(str).str.strip()
+
+    for column in ("count", "area"):
+        require((frame[column] >= 0).all(), f"{path}: {column} 음수")
+
+    require(
+        not ((frame.area == 0) & (frame["count"] > 0)).any(),
+        f"{path}: area=0 인데 count>0"
+    )
+
+    return frame[["id", "region", "count", "area"]].copy()
+
+
+def merge_levels(files, mouse, hemi):
+    """lvl1~7 을 합칩니다. 중복 ID 는 값이 일치할 때만 1회 사용."""
+
+    parts = []
+
+    empty = []
+
+    for level, path in enumerate(files, start=1):
+
+        frame = load_one_csv(path, allow_empty=True)
+
+        if len(frame) == 0:
+            empty.append(level)
+            continue
 
         frame["level"] = level
 
-        frames.append(frame)
+        parts.append(frame)
 
-    merged = pd.concat(frames, ignore_index=True)
+    if empty:
+        print(f"  {mouse} / {hemi}: lvl {empty} 는 행이 없어 건너뜁니다.")
 
-    duplicated = merged.loc[merged.duplicated("id", keep=False)]
+    require(
+        len(parts) > 0,
+        f"{mouse} / {hemi}: lvl1~7 이 모두 비어 있습니다."
+    )
 
-    if len(duplicated):
+    all_rows = pd.concat(parts, ignore_index=True)
 
-        spread = duplicated.groupby("id").agg(
-            count_spread=("count", lambda s: float(np.ptp(s))),
-            area_spread=("area", lambda s: float(np.ptp(s))),
-        )
+    duplicated = all_rows[all_rows.id.duplicated(keep=False)]
 
-        bad = spread.loc[
-            (spread.count_spread > COUNT_ATOL)
-            | (spread.area_spread > AREA_ATOL)
-        ]
+    for rid, block in duplicated.groupby("id"):
 
         require(
-            bad.empty,
-            f"{label}: 여러 level 파일에서 같은 region id 의 "
-            f"count/area 가 다릅니다.\n{bad.head(20)}"
+            len({_normalize(name) for name in block.region}) == 1,
+            f"{mouse} / {hemi}: level 사이 ID-name 불일치: {rid}"
         )
 
-    return (
-        merged
-        .sort_values(["id", "level"])
-        .drop_duplicates("id", keep="first")
-        .set_index("id", verify_integrity=True)
+        for column, tolerance in (
+            ("count", COUNT_ATOL), ("area", AREA_ATOL)
+        ):
+
+            require(
+                np.allclose(
+                    block[column], block[column].iloc[0],
+                    atol=tolerance, rtol=1e-10,
+                ),
+                f"{mouse} / {hemi}: level 사이 중복 ID 값 불일치: "
+                f"{rid} / {column}"
+            )
+
+    merged = (
+        all_rows
+        .drop_duplicates("id")
+        .drop(columns="level")
+        .set_index("id")
         .sort_index()
     )
 
+    return merged
 
-def load_reinj_tables(roots=None):
+
+def _nonnegative(values, tolerance, label):
+
+    array = np.asarray(values, dtype=float)
+
+    require(np.isfinite(array).all(), f"{label}: NaN/inf")
+
+    bad = np.flatnonzero(array < -tolerance)
+
+    require(
+        len(bad) == 0,
+        f"{label}: 음수입니다. 위치={bad[:10].tolist()}, "
+        f"값={array[bad[:10]].tolist()}"
+    )
+
+    return np.maximum(array, 0)
+
+
+def load_reinj_tables(roots=None, prefix=None):
     """
-    mouse 별
-    rh_count / rh_area / lh_count / lh_area /
-    whole_count / whole_area
+    mouse 별 region 표.
+
+    region / whole_count / rh_count / lh_count / whole_area /
+    rh_area / lh_area
     """
 
     roots = REINJ_ROOTS if roots is None else roots
+
+    prefix = REINJ_PREFIX if prefix is None else prefix
 
     tables = {}
 
     for mouse, root in roots.items():
 
-        rh = _combine_levels(root, RH_FILE_TEMPLATE, "rh", f"{mouse} rh")
-
-        whole = _combine_levels(
-            root, WHOLE_FILE_TEMPLATE, "whole", f"{mouse} whole"
-        )
-
-        shared = rh.index.intersection(whole.index)
+        directory, tried = reinj_results_directory(root)
 
         require(
-            len(shared) > 0,
-            f"{mouse}: rh 와 whole 파일에 공통 region id 가 없습니다."
+            directory is not None,
+            f"{mouse}: results 폴더를 찾지 못했습니다.\n"
+            + "\n".join(f"  {path}" for path in tried)
         )
 
-        frame = pd.DataFrame(index=shared.sort_values())
+        by_hemi = {}
 
-        frame["acronym"] = whole.loc[frame.index, "acronym"]
-        frame["name"] = whole.loc[frame.index, "name"]
+        for hemi in ("whole", "rh"):
 
-        frame["rh_count"] = rh.loc[frame.index, "count"].astype(float)
-        frame["rh_area"] = rh.loc[frame.index, "area"].astype(float)
+            files = [
+                directory / FILE_TEMPLATE.format(
+                    prefix=prefix, hemi=hemi, level=level
+                )
+                for level in LEVELS
+            ]
 
-        frame["whole_count"] = whole.loc[frame.index, "count"].astype(float)
-        frame["whole_area"] = whole.loc[frame.index, "area"].astype(float)
+            missing = [str(path) for path in files if not path.is_file()]
 
-        frame["lh_count"] = frame["whole_count"] - frame["rh_count"]
-        frame["lh_area"] = frame["whole_area"] - frame["rh_area"]
+            require(
+                not missing,
+                f"{mouse}: {len(missing)}개 CSV 가 없습니다 "
+                f"(prefix = {prefix}).\n"
+                + "\n".join(f"  {path}" for path in missing)
+            )
+
+            by_hemi[hemi] = merge_levels(files, mouse, hemi)
+
+        whole, rh = by_hemi["whole"], by_hemi["rh"]
 
         require(
-            np.isfinite(frame[[
-                "rh_count", "rh_area", "whole_count", "whole_area"
-            ]].to_numpy()).all(),
-            f"{mouse}: count/area 에 NaN 또는 inf 가 있습니다."
+            set(whole.index) == set(rh.index),
+            f"{mouse}: whole 과 rh 의 region ID 집합이 다릅니다. "
+            "결측을 0 으로 대체하지 않습니다."
         )
+
+        rh = rh.reindex(whole.index)
 
         require(
-            (frame[["rh_count", "whole_count"]].to_numpy() >= 0).all()
-            and (frame[["rh_area", "whole_area"]].to_numpy() >= 0).all(),
-            f"{mouse}: count/area 에 음수가 있습니다."
+            all(
+                _normalize(a) == _normalize(b)
+                for a, b in zip(whole.region, rh.region)
+            ),
+            f"{mouse}: whole/rh ID-name 불일치"
         )
 
-        bad = frame.loc[frame["lh_count"] < -NEGATIVE_COUNT_TOL]
+        frame = pd.DataFrame(index=whole.index)
 
-        require(
-            bad.empty,
-            f"{mouse}: rh_count > whole_count 인 region 이 있습니다.\n"
-            f"{bad[['acronym', 'rh_count', 'whole_count']].head(20)}"
-        )
+        frame["region"] = whole.region
 
-        bad = frame.loc[
-            frame["lh_area"] < -frame["whole_area"].abs() * 1e-9 - AREA_ATOL
-        ]
+        for metric, tolerance in (
+            ("count", COUNT_ATOL), ("area", AREA_ATOL)
+        ):
 
-        require(
-            bad.empty,
-            f"{mouse}: rh_area > whole_area 인 region 이 있습니다.\n"
-            f"{bad[['acronym', 'rh_area', 'whole_area']].head(20)}"
-        )
+            frame["whole_" + metric] = whole[metric].astype(float)
+            frame["rh_" + metric] = rh[metric].astype(float)
 
-        frame["lh_count"] = frame["lh_count"].clip(lower=0.0)
-        frame["lh_area"] = frame["lh_area"].clip(lower=0.0)
+            frame["lh_" + metric] = _nonnegative(
+                whole[metric].values - rh[metric].values,
+                tolerance,
+                f"{mouse}: whole - rh {metric}",
+            )
+
+        for hemi in ("lh", "rh"):
+
+            require(
+                not (
+                    (frame[hemi + "_area"] <= AREA_ATOL)
+                    & (frame[hemi + "_count"] > COUNT_ATOL)
+                ).any(),
+                f"{mouse}: {hemi} area=0 인데 count>0"
+            )
+
+        frame["results_directory"] = str(directory)
 
         tables[mouse] = frame
 
@@ -791,6 +918,31 @@ def check_run(path):
             + f" (있는 source: {list(cre)})",
             summary,
         )
+
+    available = [
+        scope
+        for scope in SCOPES
+        if (
+            path / "primary" / scope / MATCHED_SOURCE / "p.csv"
+        ).is_file()
+    ]
+
+    if not available:
+        return (
+            False,
+            "primary/<scope>/"
+            + MATCHED_SOURCE
+            + "/p.csv 가 없음 (찾은 scope: "
+            + str([
+                child.name
+                for child in (path / "primary").glob("*")
+                if child.is_dir()
+            ])
+            + ")",
+            summary,
+        )
+
+    summary["scopes"] = available
 
     try:
 
@@ -1184,274 +1336,170 @@ def cre_m1_mice(ctx):
 
 
 # ============================================================
-# region set
+# FEATURE SPACE
+#
+# Figure 1 분석이 이미 만들어 둔 feature 정의와 p 를 그대로 읽고,
+# 같은 정의를 reinjection data 에 적용합니다.
+#
+#   primary/<scope>/Motor/feature_definitions.csv
+#   primary/<scope>/Motor/p.csv
+#   source_specificity/shared_feature_definitions.csv
+#   source_specificity/p_shared_feature_space.csv
+#
+# feature 는 "parent - nearest included descendants" (residual) 이며
+# count 와 area 에 같은 선형 연산을 적용합니다.
 # ============================================================
 
-def _allgraymatter_ids(ctx, source):
+def parse_id_list(value):
+    """subtract_ids 는 JSON 또는 python list 표기로 저장되어 있습니다."""
 
-    path = (
-        ctx["run"] / "primary" / "AllGrayMatter" / source
-        / "feature_definitions.csv"
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [int(x) for x in value]
+
+    if isinstance(value, float) and np.isnan(value):
+        return []
+
+    text = str(value).strip()
+
+    if text in ("", "nan", "none", "None", "[]"):
+        return []
+
+    for parser in (json.loads, ast.literal_eval):
+
+        try:
+            parsed = parser(text)
+        except (ValueError, SyntaxError):
+            continue
+
+        if isinstance(parsed, (list, tuple)):
+            return [int(x) for x in parsed]
+
+        return [int(parsed)]
+
+    raise ValueError(f"subtract_ids 를 해석하지 못했습니다: {value!r}")
+
+
+def _read_feature_definitions(path):
+
+    frame = pd.read_csv(path)
+
+    frame.columns = [str(c).strip() for c in frame.columns]
+
+    if "feature" not in frame.columns:
+        frame = frame.rename(columns={frame.columns[0]: "feature"})
+
+    require(
+        {"feature", "hemisphere", "region_id"}.issubset(frame.columns),
+        f"{path}: feature / hemisphere / region_id column 이 필요합니다.\n"
+        f"실제 column: {list(frame.columns)}"
     )
 
-    if not path.is_file():
+    frame["region_id"] = frame["region_id"].astype(int)
+
+    frame["subtract_ids"] = (
+        frame["subtract_ids"].map(parse_id_list)
+        if "subtract_ids" in frame.columns
+        else [[] for _ in range(len(frame))]
+    )
+
+    if "region_label" not in frame.columns:
+        frame["region_label"] = frame["region_id"].astype(str)
+
+    frame["label"] = frame["region_label"].astype(str)
+
+    return frame.set_index("feature", verify_integrity=True)
+
+
+SPECIFICITY_SCOPE = "SourceSpecificity"
+
+
+def _space_paths(ctx, scope):
+
+    if scope == SPECIFICITY_SCOPE:
+
+        directory = ctx["run"] / "source_specificity"
+
+        return (
+            directory / "shared_feature_definitions.csv",
+            directory / "p_shared_feature_space.csv",
+        )
+
+    directory = ctx["run"] / "primary" / scope / MATCHED_SOURCE
+
+    return (
+        directory / "feature_definitions.csv",
+        directory / "p.csv",
+    )
+
+
+def load_feature_space(ctx, scope):
+    """Figure 1 의 feature 정의와 p 를 읽습니다."""
+
+    definition_path, p_path = _space_paths(ctx, scope)
+
+    if not (definition_path.is_file() and p_path.is_file()):
         return None
 
-    meta = pd.read_csv(path)
+    features = _read_feature_definitions(definition_path)
 
-    meta.columns = [str(col).strip() for col in meta.columns]
+    p = pd.read_csv(p_path, index_col=0).astype(float)
 
-    where = f"파일: {path}"
+    p.index = [str(i) for i in p.index]
 
-    id_col = detect_column(meta, "region_id", "region id", where,
-                           required=False)
-
-    if id_col is None:
-        id_col = detect_column(meta, "id", "region id", where)
-
-    residual_like = [
-        col
-        for col in meta.columns
-        if any(
-            key in _normalize(col)
-            for key in ("residual", "subtract", "minus", "excludedchildren")
-        )
-    ]
-
-    for col in residual_like:
-
-        values = meta[col]
-
-        has_content = (
-            values.fillna(False).astype(bool).any()
-            if values.dtype == bool
-            else values.astype(str).str.strip().replace(
-                {"": None, "nan": None, "None": None, "[]": None}
-            ).notna().any()
-        )
-
-        require(
-            not has_content,
-            f"{where}\n'{col}' 에 residual(parent - children) 정의가 "
-            "있습니다. 같은 정의를 reinjection data 에도 적용해야 하므로 "
-            "AllGrayMatter scope 를 쓰기 전에 형식 확인이 필요합니다."
-        )
-
-    hemi_col = detect_column(
-        meta, "hemisphere", "hemisphere", where, required=False
-    )
-
-    subset = meta
-
-    if hemi_col is not None:
-
-        hemisphere = meta[hemi_col].astype(str).str.strip().str.lower()
-
-        if hemisphere.isin(["ipsi", "rh", "right"]).any():
-            subset = meta.loc[hemisphere.isin(["ipsi", "rh", "right"])]
-
-    ids = sorted(set(
-        pd.to_numeric(subset[id_col], errors="coerce")
-        .dropna().astype(int).tolist()
-    ))
-
-    return ids or None
-
-
-def region_sets(ctx):
-
-    presets = ctx["presets"]
-
-    atlas = load_atlas(ctx["cfg"])
-
-    acronym_by_id = (
-        atlas.set_index("id")["acronym"].astype(str).to_dict()
-        if "acronym" in atlas.columns else {}
-    )
-
-    name_by_id = (
-        atlas.set_index("id")["name"].astype(str).to_dict()
-        if "name" in atlas.columns else {}
-    )
-
-    sets = {}
-
-    m1 = presets.loc[presets.source == MATCHED_SOURCE]
+    shared = [column for column in p.columns if column in features.index]
 
     require(
-        not m1.empty,
-        f"predefined_recipient_regions.csv 에 source == "
-        f"{MATCHED_SOURCE} 인 region 이 없습니다."
+        len(shared) > 0,
+        f"{p_path}: feature 정의와 p 의 column 이 맞지 않습니다."
     )
 
-    sets["PredefinedM1"] = m1.drop_duplicates("id").copy()
-
-    sets["Predefined20"] = pd.concat(
-        [presets.loc[presets.source == s] for s in SOURCE_ORDER],
-        ignore_index=True,
-    ).drop_duplicates("id").copy()
-
-    agm_ids = _allgraymatter_ids(ctx, MATCHED_SOURCE)
-
-    if agm_ids:
-
-        sets["AllGrayMatter"] = pd.DataFrame({
-            "id": agm_ids,
-            "acronym": [acronym_by_id.get(i, str(i)) for i in agm_ids],
-            "name": [name_by_id.get(i, str(i)) for i in agm_ids],
-            "source": "AllGrayMatter",
-        })
-
-    # ----------------------------------------------------
-    # source region 제외
-    #
-    # source-specificity 에서 reference 마다 다른 region 을 빼면
-    # distance 를 직접 비교할 수 없으므로 네 source 의 union 을
-    # 모든 scope 에서 동일하게 제외합니다.
-    # ----------------------------------------------------
-
-    cleaned = {}
-
-    for scope, frame in sets.items():
-
-        frame = frame.copy()
-
-        frame["id"] = frame["id"].astype(int)
-
-        kept = frame.loc[~frame["id"].isin(ctx["source_ids"])]
-
-        require(
-            not kept.empty,
-            f"{scope}: source region 제외 후 남는 region 이 없습니다."
-        )
-
-        cleaned[scope] = kept.drop_duplicates("id").reset_index(drop=True)
-
-    return {
-        scope: cleaned[scope] for scope in SCOPES if scope in cleaned
-    }
+    return dict(
+        scope=scope,
+        features=features.loc[shared],
+        p=p.loc[:, shared],
+    )
 
 
-def acronym_map(frame):
-    return {
-        int(row.id): str(row.acronym)
-        for row in frame.itertuples(index=False)
-    }
+def feature_spaces(ctx, scopes=None):
+
+    scopes = SCOPES if scopes is None else scopes
+
+    spaces = {}
+
+    for scope in scopes:
+
+        space = load_feature_space(ctx, scope)
+
+        if space is None:
+            print(
+                f"  {scope}: Figure 1 run 에 결과 폴더가 없어 건너뜁니다 "
+                f"({_space_paths(ctx, scope)[0]})"
+            )
+            continue
+
+        spaces[scope] = space
+
+    require(
+        len(spaces) > 0,
+        "Figure 1 run 에서 사용할 수 있는 feature space 가 없습니다.\n"
+        "primary/Predefined/<source>/ 또는 "
+        "primary/AllGrayMatter/<source>/ 폴더를 확인하십시오."
+    )
+
+    return spaces
 
 
-# ============================================================
-# density -> p
+# ------------------------------------------------------------
+# hemisphere slot
 #
-# lateralized: columns = MultiIndex (slot, region_id)
-# pooled     : columns = region_id
-# ============================================================
+#   ipsi   slot  <->  reinjection RH   (ORIENTATION 기본값)
+#   contra slot  <->  reinjection LH
+# ------------------------------------------------------------
 
-def _density(count, area):
-
-    count = np.asarray(count, dtype=float)
-    area = np.asarray(area, dtype=float)
-
-    present = area > AREA_ATOL
-
-    require(
-        not ((count > COUNT_ATOL) & ~present).any(),
-        "area = 0 인데 count > 0 인 region 이 있습니다."
-    )
-
-    out = np.full(len(count), np.nan, dtype=float)
-
-    out[present] = count[present] / area[present]
-
-    return out
-
-
-def _finalize(density, label):
-
-    valid = density.notna()
-
-    inconsistent = valid.columns[
-        valid.any(axis=0) != valid.all(axis=0)
-    ].tolist()
-
-    require(
-        not inconsistent,
-        f"{label}: 일부 mouse 에서만 area = 0 인 feature 가 있습니다: "
-        f"{inconsistent[:20]}"
-    )
-
-    kept = valid.columns[valid.all(axis=0)]
-
-    require(len(kept) > 0, f"{label}: 유효한 feature 가 없습니다.")
-
-    return density.loc[:, kept].astype(float)
-
-
-def fig1_density(ctx, ids, mode=None):
-
-    mode = HEMI_MODE if mode is None else mode
-
-    ids = [int(i) for i in ids]
-
-    raw = ctx["raw"]
-
-    frame = raw.loc[
-        raw.mouse.isin(ctx["cre_mice"]) & raw.id.isin(ids)
-    ].set_index(["mouse", "id"], verify_integrity=True)
-
-    if mode == "pooled":
-        columns = pd.Index(ids, name="region_id")
-    else:
-        columns = pd.MultiIndex.from_product(
-            [SLOTS, ids], names=["slot", "region_id"]
-        )
-
-    density = pd.DataFrame(
-        index=ctx["cre_mice"], columns=columns, dtype=float
-    )
-
-    for mouse in ctx["cre_mice"]:
-
-        side = str(
-            ctx["manifest"].at[mouse, "injection_side"]
-        ).strip().upper()
-
-        require(side in ("R", "L"), f"{mouse}: injection_side 가 R/L 이 아닙니다.")
-
-        sub = frame.xs(mouse).reindex(ids)
-
-        require(
-            sub[["rh_count", "rh_area", "lh_count", "lh_area"]]
-            .notna().to_numpy().all(),
-            f"{mouse}: raw_readout_regions.csv 에 없는 region 이 있습니다:\n"
-            f"{sub.index[sub.rh_count.isna()].tolist()[:20]}"
-        )
-
-        ipsi = "rh" if side == "R" else "lh"
-        contra = "lh" if side == "R" else "rh"
-
-        if mode == "pooled":
-
-            density.loc[mouse] = _density(
-                sub[f"{ipsi}_count"] + sub[f"{contra}_count"],
-                sub[f"{ipsi}_area"] + sub[f"{contra}_area"],
-            )
-
-        else:
-
-            density.loc[mouse, "s1"] = _density(
-                sub[f"{ipsi}_count"], sub[f"{ipsi}_area"]
-            )
-
-            density.loc[mouse, "s2"] = _density(
-                sub[f"{contra}_count"], sub[f"{contra}_area"]
-            )
-
-    return _finalize(density, "Figure 1 Cre")
-
-
-def reinj_density(tables, ids, mode=None, orientation=None):
-
-    mode = HEMI_MODE if mode is None else mode
+def reinj_side_for(hemisphere, orientation=None):
 
     orientation = ORIENTATION if orientation is None else orientation
 
@@ -1460,109 +1508,161 @@ def reinj_density(tables, ids, mode=None, orientation=None):
         "ORIENTATION 은 rh_to_ipsi 또는 rh_to_contra 여야 합니다."
     )
 
-    ids = [int(i) for i in ids]
-
-    if mode == "pooled":
-        columns = pd.Index(ids, name="region_id")
-    else:
-        columns = pd.MultiIndex.from_product(
-            [SLOTS, ids], names=["slot", "region_id"]
-        )
-
-    density = pd.DataFrame(
-        index=list(tables), columns=columns, dtype=float
-    )
-
     first, second = (
         ("rh", "lh") if orientation == "rh_to_ipsi" else ("lh", "rh")
     )
 
+    return first if hemisphere == "ipsi" else second
+
+
+def apply_features(tables, features, orientation=None):
+    """
+    Figure 1 의 residual 정의를 reinjection data 에 그대로 적용해
+    feature 별 count / area 를 만듭니다.
+    """
+
+    mice = list(tables)
+
+    count = pd.DataFrame(
+        index=mice, columns=features.index, dtype=float
+    )
+
+    area = count.copy()
+
+    needed = set()
+
+    for record in features.itertuples():
+        needed.add(int(record.region_id))
+        needed.update(int(i) for i in record.subtract_ids)
+
     for mouse, frame in tables.items():
 
-        sub = frame.reindex(ids)
-
-        missing = sub.index[sub["whole_count"].isna()].tolist()
+        missing = sorted(needed - set(frame.index.astype(int)))
 
         require(
             not missing,
-            f"{mouse}: lvl1~7 파일에 없는 region id 가 있습니다: "
+            f"{mouse}: Figure 1 feature 에 쓰인 region id 가 "
+            f"reinjection CSV 에 없습니다 ({len(missing)}개): "
             f"{missing[:20]}"
         )
 
-        if mode == "pooled":
+        for metric, output, tolerance in (
+            ("count", count, COUNT_ATOL),
+            ("area", area, AREA_ATOL),
+        ):
 
-            density.loc[mouse] = _density(
-                sub["whole_count"], sub["whole_area"]
+            values = []
+
+            for record in features.itertuples():
+
+                column = (
+                    reinj_side_for(record.hemisphere, orientation)
+                    + "_" + metric
+                )
+
+                value = float(frame.at[int(record.region_id), column])
+
+                if record.subtract_ids:
+                    value -= float(
+                        frame.loc[
+                            [int(i) for i in record.subtract_ids], column
+                        ].sum()
+                    )
+
+                values.append(value)
+
+            output.loc[mouse] = _nonnegative(
+                values,
+                tolerance,
+                f"{mouse}: parent-minus-children {metric}",
             )
 
-        else:
-
-            density.loc[mouse, "s1"] = _density(
-                sub[f"{first}_count"], sub[f"{first}_area"]
-            )
-
-            density.loc[mouse, "s2"] = _density(
-                sub[f"{second}_count"], sub[f"{second}_area"]
-            )
-
-    return _finalize(density, "Reinjection")
+    return count, area
 
 
-def common_feature_space(
-    ctx, tables, ids, mode=None, orientation=None
-):
-    """
-    두 dataset 에서 모두 유효한 feature 만 남기고
-    같은 순서로 p 를 반환합니다.
-    """
+def reinj_p(tables, features, orientation=None):
 
-    mode = HEMI_MODE if mode is None else mode
+    count, area = apply_features(tables, features, orientation)
 
-    cre = fig1_density(ctx, ids, mode=mode)
+    present = area > AREA_ATOL
 
-    reinj = reinj_density(
-        tables, ids, mode=mode, orientation=orientation
+    require(
+        not ((count > COUNT_ATOL) & ~present).to_numpy().any(),
+        "reinjection: area=0 인 feature 에 count>0 이 있습니다."
     )
 
+    density = count.where(present) / area.where(present)
+
+    valid = present.all(axis=0)
+
+    dropped = [
+        feature for feature in features.index if not valid[feature]
+    ]
+
+    density = density.loc[:, valid]
+
+    return to_p(density), count, area, dropped
+
+
+def common_feature_space(ctx, tables, scope, orientation=None):
+    """
+    Figure 1 p 와 reinjection p 를 같은 feature 집합으로 맞춥니다.
+
+    returns (p_cre, p_reinj, features)
+    """
+
+    space = (
+        scope if isinstance(scope, dict) else load_feature_space(ctx, scope)
+    )
+
+    require(space is not None, f"{scope}: feature space 를 읽지 못했습니다.")
+
+    features = space["features"]
+
+    p_fig1 = space["p"]
+
+    p_reinj, _, _, dropped = reinj_p(tables, features, orientation)
+
+    if dropped:
+        print(
+            f"  {space['scope']}: reinjection 에서 area=0 인 feature "
+            f"{len(dropped)}개 제외"
+        )
+
     shared = [
-        column for column in cre.columns if column in set(reinj.columns)
+        feature for feature in features.index
+        if feature in set(p_fig1.columns) and feature in set(p_reinj.columns)
     ]
 
     require(
         len(shared) >= 3,
-        "두 dataset 에서 공통으로 유효한 feature 가 3개 미만입니다."
+        f"{space['scope']}: 공통 feature 가 3개 미만입니다."
     )
 
     return (
-        to_p(cre.loc[:, shared]),
-        to_p(reinj.loc[:, shared]),
-        shared,
+        to_p(p_fig1.loc[:, shared]),
+        to_p(p_reinj.loc[:, shared]),
+        features.loc[shared],
     )
 
 
-def feature_frame(shared, acronyms, mode=None):
-    """shared feature list -> slot / region_id / acronym 표"""
+def slot_of(features):
+    """figure 에서 쓰는 hemisphere slot 이름 (s1 = ipsi, s2 = contra)."""
 
-    mode = HEMI_MODE if mode is None else mode
-
-    if mode == "pooled":
-
-        return pd.DataFrame({
-            "slot": "pooled",
-            "region_id": [int(c) for c in shared],
-            "acronym": [acronyms.get(int(c), str(c)) for c in shared],
-        })
-
-    return pd.DataFrame({
-        "slot": [c[0] for c in shared],
-        "region_id": [int(c[1]) for c in shared],
-        "acronym": [acronyms.get(int(c[1]), str(c[1])) for c in shared],
-    })
+    return features["hemisphere"].map(
+        lambda h: "s1" if h == "ipsi" else "s2"
+    )
 
 
 # ============================================================
-# atlas hierarchy / broad region pool
+# ATLAS HIERARCHY (permutation 의 major division 분류에만 사용)
 # ============================================================
+
+DIVISION_ACRONYMS = [
+    "Isocortex", "OLF", "HPF", "CTXsp",
+    "STR", "PAL", "TH", "HY", "MB", "P", "MY", "CB",
+]
+
 
 def _hierarchy(atlas):
 
@@ -1598,51 +1698,12 @@ def _ancestors(rid, parents):
     return chain
 
 
-DIVISION_ACRONYMS = [
-    "Isocortex", "OLF", "HPF", "CTXsp",
-    "STR", "PAL", "TH", "HY", "MB", "P", "MY", "CB",
-]
-
-
-def leaf_pool(ctx, tables):
-    """
-    두 dataset 에 모두 있는 region 중, 자신의 descendant 가 pool 에
-    함께 들어있지 않은 region 만 남겨 서로 겹치지 않는 broad pool 을
-    만듭니다 (분석 전략 문서 2번).
-    """
+def division_map(ctx, region_ids):
+    """region id -> major anatomical division acronym"""
 
     atlas = load_atlas(ctx["cfg"])
 
     parents = _hierarchy(atlas)
-
-    fig1_ids = set(ctx["raw"].id.astype(int))
-
-    reinj_ids = set.intersection(*[
-        set(frame.index.astype(int)) for frame in tables.values()
-    ])
-
-    available = (fig1_ids & reinj_ids) - set(ctx["source_ids"])
-
-    available = {
-        rid for rid in available
-        if not (set(_ancestors(rid, parents)) & set(ctx["source_ids"]))
-    }
-
-    require(
-        len(available) > 20,
-        "broad region pool 이 20개 미만입니다. Figure 1 "
-        "raw_readout_regions.csv 와 reinjection lvl 파일의 region id 를 "
-        "확인하십시오."
-    )
-
-    has_descendant = set()
-
-    for rid in available:
-        for ancestor in _ancestors(rid, parents):
-            if ancestor in available:
-                has_descendant.add(ancestor)
-
-    pool_ids = sorted(available - has_descendant)
 
     acronym_by_id = (
         atlas.set_index("id")["acronym"].astype(str).to_dict()
@@ -1655,32 +1716,57 @@ def leaf_pool(ctx, tables):
         if acronym_by_id.get(rid) in DIVISION_ACRONYMS
     }
 
-    def division_of(rid):
+    out = {}
+
+    for rid in region_ids:
+
+        rid = int(rid)
 
         if rid in division_ids:
-            return division_ids[rid]
+            out[rid] = division_ids[rid]
+            continue
+
+        found = "other"
 
         for ancestor in _ancestors(rid, parents):
+
             if ancestor in division_ids:
-                return division_ids[ancestor]
+                found = division_ids[ancestor]
+                break
 
-        return "other"
+        out[rid] = found
 
-    area = [
-        float(np.mean([
-            frame.at[rid, "whole_area"] for frame in tables.values()
-        ]))
-        for rid in pool_ids
-    ]
+    return out, parents
 
-    frame = pd.DataFrame({
-        "id": pool_ids,
-        "acronym": [acronym_by_id.get(rid, str(rid)) for rid in pool_ids],
-        "division": [division_of(rid) for rid in pool_ids],
-        "area": area,
-    }).set_index("id")
 
-    return frame, parents
+def predefined_m1_ids(ctx):
+    """Figure 1 에서 M1 의 recipient 로 고정한 region id."""
+
+    presets = ctx["presets"]
+
+    ids = (
+        presets.loc[presets.source == MATCHED_SOURCE, "id"]
+        .astype(int).tolist()
+    )
+
+    require(
+        len(ids) > 0,
+        f"predefined_recipient_regions.csv 에 {MATCHED_SOURCE} "
+        "recipient region 이 없습니다."
+    )
+
+    return ids
+
+
+def fig1_table(ctx, scope, name):
+    """primary/<scope>/Motor/<name>.csv"""
+
+    path = ctx["run"] / "primary" / scope / MATCHED_SOURCE / f"{name}.csv"
+
+    if not path.is_file():
+        return None
+
+    return pd.read_csv(path, index_col=0)
 
 
 # ============================================================
@@ -1694,74 +1780,76 @@ def make_overview(ctx, tables, show=None):
     cre_mice = cre_m1_mice(ctx)
     reinj_mice = list(tables)
 
-    lateralized = HEMI_MODE != "pooled"
-
     written = []
     records = []
 
-    for scope, frame in region_sets(ctx).items():
+    for scope, space in feature_spaces(ctx).items():
 
-        p_cre, p_reinj, shared = common_feature_space(
-            ctx, tables, frame["id"].tolist()
+        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
+
+        p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
+
+        require(
+            len(p_cre) > 0,
+            f"{scope}: p.csv 에 Cre {SOURCE_LABEL[MATCHED_SOURCE]} "
+            "mouse 가 없습니다."
         )
 
-        p_cre = p_cre.loc[cre_mice]
         p_reinj = p_reinj.loc[reinj_mice]
 
-        acronyms = acronym_map(frame)
+        slots = slot_of(features)
 
-        info = feature_frame(shared, acronyms)
+        label_by_region = (
+            features.groupby("region_id")["label"].first().to_dict()
+        )
 
-        # region 순서: Cre reference 에서 양쪽 hemisphere 합이 큰 순
         reference = p_cre.mean(axis=0)
 
-        if lateralized:
-
-            by_region = (
-                pd.Series(
-                    reference.to_numpy(),
-                    index=info["region_id"].to_numpy(),
-                )
-                .groupby(level=0).sum()
-                .sort_values(ascending=False)
+        region_total = (
+            pd.Series(
+                reference.to_numpy(),
+                index=features["region_id"].to_numpy(),
             )
+            .groupby(level=0).sum()
+            .sort_values(ascending=False)
+        )
 
-            region_order = by_region.index.tolist()
-
-        else:
-
-            region_order = (
-                reference.sort_values(ascending=False).index.tolist()
-            )
-
-        label_by_id = dict(zip(info["region_id"], info["acronym"]))
-
-        slots = SLOTS if lateralized else ["pooled"]
+        region_order = region_total.index.tolist()
 
         def matrix_for(p, mice, slot):
 
-            if lateralized:
-                sub = p.xs(slot, level="slot", axis=1)
-            else:
-                sub = p
+            columns = {
+                int(features.at[feature, "region_id"]): feature
+                for feature in features.index
+                if slots[feature] == slot
+            }
 
-            available = [
-                rid for rid in region_order if rid in set(sub.columns)
-            ]
+            table = pd.DataFrame(
+                index=region_order, columns=list(mice) + ["Mean"],
+                dtype=float,
+            )
 
-            table = sub.loc[mice, available].T
+            for region in region_order:
 
-            table["Mean"] = sub.loc[mice, available].mean(axis=0)
+                feature = columns.get(region)
 
-            return table.reindex(region_order)
+                if feature is None:
+                    continue
+
+                values = p.loc[mice, feature]
+
+                table.loc[region, mice] = values.to_numpy()
+                table.at[region, "Mean"] = float(values.mean())
+
+            return table
 
         panels = {
             (group, slot): matrix_for(p, mice, slot)
             for group, p, mice in (
-                ("Cre", p_cre, cre_mice),
+                ("Cre", p_cre, list(p_cre.index)),
                 ("Reinj", p_reinj, reinj_mice),
             )
-            for slot in slots
+            for slot in SLOTS
         }
 
         vmax = float(np.sqrt(max(
@@ -1773,19 +1861,17 @@ def make_overview(ctx, tables, show=None):
 
             for column in table.columns:
 
-                for rid in region_order:
+                for region in region_order:
 
-                    value = table.at[rid, column]
+                    value = table.at[region, column]
 
                     records.append(dict(
                         scope=scope,
                         group=group,
-                        hemisphere=SLOT_LABEL.get(
-                            group, {}
-                        ).get(slot, slot),
+                        hemisphere=SLOT_LABEL[group][slot],
                         column=column,
-                        region_id=rid,
-                        acronym=label_by_id.get(rid, str(rid)),
+                        region_id=region,
+                        label=label_by_region.get(region, str(region)),
                         p=float(value) if pd.notna(value) else np.nan,
                         sqrt_p=(
                             float(np.sqrt(value))
@@ -1799,37 +1885,28 @@ def make_overview(ctx, tables, show=None):
 
         n_region = len(region_order)
 
-        n_cre = len(cre_mice) + 1
+        n_cre = len(p_cre) + 1
         n_reinj = len(reinj_mice) + 1
 
-        if lateralized:
-            ratios = [n_cre, n_cre, 3.4, n_reinj, n_reinj, 0.55]
-            positions = {
-                ("Cre", "s1"): 0,
-                ("Cre", "s2"): 1,
-                ("Reinj", "s1"): 3,
-                ("Reinj", "s2"): 4,
-            }
-            label_position = 2
-            colorbar_position = 5
-            width = 10.6
-        else:
-            ratios = [n_cre, 3.4, n_reinj, 0.55]
-            positions = {("Cre", "pooled"): 0, ("Reinj", "pooled"): 2}
-            label_position = 1
-            colorbar_position = 3
-            width = 8.6
+        ratios = [n_cre, n_cre, 4.0, n_reinj, n_reinj, 0.55]
+
+        positions = {
+            ("Cre", "s1"): 0,
+            ("Cre", "s2"): 1,
+            ("Reinj", "s1"): 3,
+            ("Reinj", "s2"): 4,
+        }
 
         height = max(4.6, 0.19 * n_region + 2.2)
 
         with rc():
 
-            fig = plt.figure(figsize=(width, height))
+            fig = plt.figure(figsize=(11.2, height))
 
             grid = fig.add_gridspec(
                 1, len(ratios),
                 width_ratios=ratios,
-                left=0.03, right=0.945, bottom=0.085, top=0.78,
+                left=0.03, right=0.945, bottom=0.085, top=0.755,
                 wspace=0.07,
             )
 
@@ -1864,9 +1941,7 @@ def make_overview(ctx, tables, show=None):
                         "Mean" if column == "Mean" else str(index + 1)
                         for index, column in enumerate(table.columns)
                     ],
-                    fontsize=7.5,
-                    fontfamily=RENDER_FONT,
-                    rotation=90,
+                    fontsize=7.5, fontfamily=RENDER_FONT, rotation=90,
                 )
 
                 ax.tick_params(axis="both", length=0)
@@ -1874,11 +1949,9 @@ def make_overview(ctx, tables, show=None):
                 ax.axvline(table.shape[1] - 1.5, color="white", lw=1.3)
 
                 ax.set_title(
-                    SLOT_LABEL.get(group, {}).get(slot, ""),
-                    fontsize=10,
-                    fontfamily=RENDER_FONT,
-                    fontstyle="italic",
-                    pad=24,
+                    SLOT_LABEL[group][slot],
+                    fontsize=10, fontfamily=RENDER_FONT,
+                    fontstyle="italic", pad=16,
                 )
 
                 for spine in ax.spines.values():
@@ -1886,7 +1959,6 @@ def make_overview(ctx, tables, show=None):
 
                 axes[(group, slot)] = ax
 
-            # group header
             for group, color in (
                 ("Cre", SOURCE_COLORS[MATCHED_SOURCE]),
                 ("Reinj", REINJ_COLOR),
@@ -1900,50 +1972,44 @@ def make_overview(ctx, tables, show=None):
                 right = max(ax.get_position().x1 for ax in group_axes)
 
                 n_mouse = (
-                    len(cre_mice) if group == "Cre" else len(reinj_mice)
+                    len(p_cre) if group == "Cre" else len(reinj_mice)
                 )
 
                 fig.text(
-                    (left + right) / 2, 0.875,
+                    (left + right) / 2, 0.885,
                     f"{GROUP_LABEL[group]}  (n = {n_mouse})",
                     ha="center", va="center",
-                    fontsize=12,
-                    fontfamily=RENDER_FONT,
-                    fontweight="bold",
-                    color=color,
+                    fontsize=12, fontfamily=RENDER_FONT,
+                    fontweight="bold", color=color,
                 )
 
-            # region label
-            label_ax = fig.add_subplot(grid[0, label_position])
+            label_ax = fig.add_subplot(grid[0, 2])
 
             label_ax.set(xlim=(0, 1), ylim=(n_region - 0.5, -0.5))
 
             label_ax.axis("off")
 
             fontsize = (
-                8.5 if n_region <= 40 else max(3.2, 330 / n_region)
+                8.5 if n_region <= 40 else max(3.0, 330 / n_region)
             )
 
-            for index, rid in enumerate(region_order):
+            for index, region in enumerate(region_order):
 
                 label_ax.text(
                     0.5, index,
-                    label_by_id.get(rid, str(rid)),
+                    label_by_region.get(region, str(region)),
                     ha="center", va="center",
-                    fontsize=fontsize,
-                    fontfamily=RENDER_FONT,
+                    fontsize=fontsize, fontfamily=RENDER_FONT,
                     color="#B96524",
                 )
 
             label_ax.set_title(
                 "Recipient\nregion",
-                fontsize=9,
-                fontfamily=RENDER_FONT,
-                color="#B96524",
-                pad=8,
+                fontsize=9, fontfamily=RENDER_FONT,
+                color="#B96524", pad=8,
             )
 
-            cax = fig.add_subplot(grid[0, colorbar_position])
+            cax = fig.add_subplot(grid[0, 5])
 
             cbar = fig.colorbar(image, cax=cax)
 
@@ -1955,14 +2021,12 @@ def make_overview(ctx, tables, show=None):
                 tick.set_fontfamily(RENDER_FONT)
 
             fig.text(
-                0.5, 0.965,
-                f"{SCOPE_LABEL[scope]}   "
-                f"({n_region} regions × "
-                f"{'2 hemispheres' if lateralized else 'bilateral'})",
+                0.5, 0.955,
+                f"{SCOPE_LABEL.get(scope, scope)}   "
+                f"({n_region} regions × 2 hemispheres, "
+                f"{len(features)} features)",
                 ha="center", va="center",
-                fontsize=12,
-                fontfamily=RENDER_FONT,
-                fontweight="bold",
+                fontsize=12, fontfamily=RENDER_FONT, fontweight="bold",
             )
 
             path = save_svg(
@@ -1971,7 +2035,7 @@ def make_overview(ctx, tables, show=None):
 
         written.append(path)
 
-        print(f"  {scope}: {n_region} regions -> {path.name}")
+        print(f"  {scope}: {len(features)} features -> {path.name}")
 
     values = pd.DataFrame(records)
 
@@ -1979,7 +2043,7 @@ def make_overview(ctx, tables, show=None):
         out / "Reinj_overview_heatmap_values.csv", index=False
     )
 
-    return dict(svg=[str(p) for p in written], values=values)
+    return dict(svg=[str(path) for path in written], values=values)
 
 
 # ============================================================
@@ -1993,25 +2057,31 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
     cre_mice = cre_m1_mice(ctx)
     reinj_mice = list(tables)
 
-    lateralized = HEMI_MODE != "pooled"
+    spaces = feature_spaces(ctx)
 
-    sets = region_sets(ctx)
-
-    scopes = list(sets)
+    scopes = list(spaces)
 
     panels = {}
     point_records = []
     metrics = []
 
-    for scope, frame in sets.items():
+    for scope, space in spaces.items():
 
-        p_cre, p_reinj, shared = common_feature_space(
-            ctx, tables, frame["id"].tolist()
-        )
+        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
 
-        info = feature_frame(shared, acronym_map(frame))
+        p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
 
-        reference = p_cre.loc[cre_mice].mean(axis=0)
+        slots = slot_of(features)
+
+        info = pd.DataFrame({
+            "feature": features.index,
+            "hemisphere": features["hemisphere"].to_numpy(),
+            "slot": slots.to_numpy(),
+            "region_id": features["region_id"].to_numpy(),
+            "label": features["label"].to_numpy(),
+        })
+
+        reference = p_cre.mean(axis=0)
 
         targets = [
             (mouse, "individual", index, p_reinj.loc[mouse])
@@ -2047,17 +2117,17 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
                 scope=scope,
                 comparison=comparison,
                 reinj_target=label,
-                n_Cre_mice=len(cre_mice),
+                n_Cre_mice=len(p_cre),
                 n_reinj_mice=(
                     len(reinj_mice) if comparison == "mean" else 1
                 ),
-                n_features=len(shared),
+                n_features=len(features),
                 n_shown=int(keep.sum()),
                 spearman_rho=spearman_rho(a[keep], b[keep]),
                 hellinger=hellinger(a, b),
             )
 
-            for slot in (SLOTS if lateralized else []):
+            for slot in SLOTS:
 
                 mask = (info["slot"] == slot).to_numpy() & keep
 
@@ -2101,21 +2171,18 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
         "s2": dict(
             facecolor="white", edgecolor=REINJ_COLOR, linewidth=0.8
         ),
-        "pooled": dict(
-            facecolor=REINJ_COLOR, edgecolor="white", linewidth=0.35
-        ),
     }
 
     with rc():
 
         fig, axes = plt.subplots(
             n_rows, n_cols,
-            figsize=(n_cols * panel_inch, n_rows * panel_inch + 0.5),
+            figsize=(n_cols * panel_inch + 0.6, n_rows * panel_inch + 0.5),
             squeeze=False,
         )
 
         fig.subplots_adjust(
-            left=0.09, right=0.985, top=0.90, bottom=0.115,
+            left=0.11, right=0.985, top=0.90, bottom=0.115,
             wspace=0.26, hspace=0.36,
         )
 
@@ -2125,11 +2192,9 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
 
             fig.text(
                 (position.x0 + position.x1) / 2, 0.955,
-                SCOPE_LABEL[scope],
+                SCOPE_LABEL.get(scope, scope),
                 ha="center", va="center",
-                fontsize=11,
-                fontfamily=RENDER_FONT,
-                fontweight="bold",
+                fontsize=11, fontfamily=RENDER_FONT, fontweight="bold",
             )
 
             for row in range(n_rows):
@@ -2152,7 +2217,7 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
                     color="#B5B5B5", lw=0.8, zorder=1,
                 )
 
-                for slot in (SLOTS if lateralized else ["pooled"]):
+                for slot in SLOTS:
 
                     selected = data.loc[
                         data.included & (data.slot == slot)
@@ -2198,8 +2263,7 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
                         f"ρ = {rho:.2f}" if np.isfinite(rho) else "ρ = NA"
                     )
                     + f"   H = {metric['hellinger']:.2f}",
-                    fontsize=9.5,
-                    fontfamily=RENDER_FONT,
+                    fontsize=9.5, fontfamily=RENDER_FONT,
                     fontweight="bold" if is_mean else "normal",
                     pad=5,
                 )
@@ -2212,36 +2276,30 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
         )
 
         fig.text(
-            0.022, 0.5,
+            0.025, 0.5,
             "Intranasal EV reinjection (√p)",
             ha="center", va="center", rotation=90,
             fontsize=11, fontfamily=RENDER_FONT,
         )
 
-        if lateralized:
-
-            fig.legend(
-                handles=[
-                    Line2D(
-                        [0], [0], marker="o", linestyle="",
-                        markerfacecolor=REINJ_COLOR,
-                        markeredgecolor="white",
-                        markersize=6,
-                        label="Cre ipsilateral  ·  reinjection RH",
-                    ),
-                    Line2D(
-                        [0], [0], marker="o", linestyle="",
-                        markerfacecolor="white",
-                        markeredgecolor=REINJ_COLOR,
-                        markeredgewidth=1.0,
-                        markersize=6,
-                        label="Cre contralateral  ·  reinjection LH",
-                    ),
-                ],
-                loc="lower center",
-                bbox_to_anchor=(0.5, 0.0),
-                ncol=2, frameon=False, fontsize=8.5,
-            )
+        fig.legend(
+            handles=[
+                Line2D(
+                    [0], [0], marker="o", linestyle="",
+                    markerfacecolor=REINJ_COLOR, markeredgecolor="white",
+                    markersize=6,
+                    label="Cre ipsilateral  ·  reinjection RH",
+                ),
+                Line2D(
+                    [0], [0], marker="o", linestyle="",
+                    markerfacecolor="white", markeredgecolor=REINJ_COLOR,
+                    markeredgewidth=1.0, markersize=6,
+                    label="Cre contralateral  ·  reinjection LH",
+                ),
+            ],
+            loc="lower center", bbox_to_anchor=(0.5, 0.0),
+            ncol=2, frameon=False, fontsize=8.5,
+        )
 
         path = save_svg(fig, out / "Reinj_vs_CreM1_scatter.svg", show)
 
@@ -2274,9 +2332,9 @@ def make_hellinger(ctx, tables, show=None):
     cre_mice = cre_m1_mice(ctx)
     reinj_mice = list(tables)
 
-    sets = region_sets(ctx)
+    spaces = feature_spaces(ctx)
 
-    scopes = list(sets)
+    scopes = list(spaces)
 
     records = []
     summary = []
@@ -2285,13 +2343,13 @@ def make_hellinger(ctx, tables, show=None):
         "rh_to_contra" if ORIENTATION == "rh_to_ipsi" else "rh_to_ipsi"
     )
 
-    for scope, frame in sets.items():
+    for scope, space in spaces.items():
 
-        ids = frame["id"].tolist()
+        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
 
-        p_cre, p_reinj, shared = common_feature_space(ctx, tables, ids)
+        p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
 
-        p_cre = p_cre.loc[cre_mice]
+        present_cre = list(p_cre.index)
 
         reference = p_cre.mean(axis=0)
 
@@ -2305,9 +2363,12 @@ def make_hellinger(ctx, tables, show=None):
                 hellinger=hellinger(p_reinj.loc[mouse], reference),
             ))
 
-        for number, mouse in enumerate(cre_mice, start=1):
+        for number, mouse in enumerate(present_cre, start=1):
 
-            others = [m for m in cre_mice if m != mouse]
+            others = [m for m in present_cre if m != mouse]
+
+            if not others:
+                continue
 
             records.append(dict(
                 scope=scope,
@@ -2319,7 +2380,7 @@ def make_hellinger(ctx, tables, show=None):
                 ),
             ))
 
-        for first, second in combinations(cre_mice, 2):
+        for first, second in combinations(present_cre, 2):
 
             records.append(dict(
                 scope=scope,
@@ -2329,24 +2390,15 @@ def make_hellinger(ctx, tables, show=None):
                 hellinger=hellinger(p_cre.loc[first], p_cre.loc[second]),
             ))
 
-        # ----------------------------------------------------
         # hemisphere 대응을 뒤집은 경우 (sensitivity)
-        # ----------------------------------------------------
+        _, p_reinj_flipped, _ = common_feature_space(
+            ctx, tables, space, orientation=other_orientation
+        )
 
-        flipped_mean = np.nan
-
-        if HEMI_MODE != "pooled":
-
-            p_cre_f, p_reinj_f, _ = common_feature_space(
-                ctx, tables, ids, orientation=other_orientation
-            )
-
-            reference_f = p_cre_f.loc[cre_mice].mean(axis=0)
-
-            flipped_mean = float(np.mean([
-                hellinger(p_reinj_f.loc[mouse], reference_f)
-                for mouse in reinj_mice
-            ]))
+        flipped_mean = float(np.mean([
+            hellinger(p_reinj_flipped.loc[mouse], reference)
+            for mouse in reinj_mice
+        ]))
 
         table = pd.DataFrame([r for r in records if r["scope"] == scope])
 
@@ -2357,14 +2409,15 @@ def make_hellinger(ctx, tables, show=None):
 
         summary.append(dict(
             scope=scope,
-            n_features=len(shared),
+            n_features=len(features),
             n_reinj=len(values["reinj_to_reference"]),
-            n_Cre=len(cre_mice),
+            n_Cre=len(present_cre),
             reinj_mean=float(np.mean(values["reinj_to_reference"])),
             reinj_min=float(np.min(values["reinj_to_reference"])),
             reinj_max=float(np.max(values["reinj_to_reference"])),
             cre_loo_mean=float(np.mean(values["cre_loo"])),
             cre_pairwise_mean=float(np.mean(values["cre_pairwise"])),
+            cre_pairwise_min=float(np.min(values["cre_pairwise"])),
             cre_pairwise_max=float(np.max(values["cre_pairwise"])),
             Delta_H_reinj_minus_CreLOO=float(
                 np.mean(values["reinj_to_reference"])
@@ -2410,12 +2463,12 @@ def make_hellinger(ctx, tables, show=None):
 
         fig, axes = plt.subplots(
             1, len(scopes),
-            figsize=(3.6 * len(scopes) + 0.6, 4.8),
+            figsize=(3.8 * len(scopes) + 0.8, 4.8),
             sharey=True, squeeze=False,
         )
 
         fig.subplots_adjust(
-            left=0.085, right=0.985, top=0.84, bottom=0.27, wspace=0.16,
+            left=0.10, right=0.985, top=0.84, bottom=0.27, wspace=0.16,
         )
 
         for col, scope in enumerate(scopes):
@@ -2484,13 +2537,14 @@ def make_hellinger(ctx, tables, show=None):
                 ax.spines[name].set_linewidth(0.7)
 
             ax.set_title(
-                SCOPE_LABEL[scope] + f"\n{int(row['n_features'])} features",
+                SCOPE_LABEL.get(scope, scope)
+                + f"\n{int(row['n_features'])} features",
                 fontsize=11, fontfamily=RENDER_FONT,
                 fontweight="bold", pad=8,
             )
 
         fig.text(
-            0.018, 0.58,
+            0.022, 0.58,
             "Hellinger distance",
             rotation=90, ha="center", va="center",
             fontsize=11, fontfamily=RENDER_FONT,
@@ -2516,15 +2570,12 @@ def make_hellinger(ctx, tables, show=None):
                 label="Cre M1 pairwise (inter-animal variability)",
             ),
             Line2D([0], [0], color="#666666", linewidth=2.2, label="Mean"),
-        ]
-
-        if HEMI_MODE != "pooled":
-
-            handles.append(Line2D(
+            Line2D(
                 [0], [0], color=REINJ_COLOR, linewidth=1.2,
                 linestyle=":",
                 label="Mean with RH/LH assignment flipped",
-            ))
+            ),
+        ]
 
         fig.legend(
             handles=handles,
@@ -2553,14 +2604,11 @@ def make_hellinger(ctx, tables, show=None):
 
 
 # ============================================================
-# FIGURE 4  matched vs mismatched source
+# FIGURE 4  matched versus mismatched source
 #
-# PredefinedM1 은 region 자체가 M1 에서 정의되어 circular 하므로
-# 이 분석에서는 제외합니다.
+# Figure 1 분석의 source_specificity/ 결과와 같은 feature space
+# (네 source 의 union 을 공통 제외)를 사용합니다.
 # ============================================================
-
-SPECIFICITY_EXCLUDED_SCOPES = ("PredefinedM1",)
-
 
 def make_source_specificity(ctx, tables, show=None):
 
@@ -2568,78 +2616,74 @@ def make_source_specificity(ctx, tables, show=None):
 
     reinj_mice = list(tables)
 
-    sets = {
-        scope: frame
-        for scope, frame in region_sets(ctx).items()
-        if scope not in SPECIFICITY_EXCLUDED_SCOPES
-    }
+    space = load_feature_space(ctx, SPECIFICITY_SCOPE)
 
-    require(len(sets) > 0, "source-specificity 에 사용할 scope 가 없습니다.")
+    require(
+        space is not None,
+        "source_specificity/ 폴더가 없어 matched-vs-mismatched 분석을 "
+        "할 수 없습니다. Figure 1 분석을 "
+        "run_source_specificity=True 로 실행하셔야 합니다."
+    )
 
-    matrices = {}
-    rows = []
+    p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
 
-    for scope, frame in sets.items():
+    references = {}
 
-        p_cre, p_reinj, shared = common_feature_space(
-            ctx, tables, frame["id"].tolist()
+    for source in SOURCE_ORDER:
+
+        source_mice = [
+            mouse for mouse in ctx["cohorts"]["Cre"][source]
+            if mouse in p_cre.index
+        ]
+
+        require(
+            len(source_mice) > 0,
+            f"source_specificity p 에 Cre / {source} mouse 가 없습니다."
         )
 
-        references = {}
+        references[source] = p_cre.loc[source_mice].mean(axis=0)
 
+    matrix = pd.DataFrame(
+        index=reinj_mice, columns=SOURCE_ORDER, dtype=float
+    )
+
+    for mouse in reinj_mice:
         for source in SOURCE_ORDER:
-
-            source_mice = list(ctx["cohorts"]["Cre"][source])
-
-            require(
-                len(source_mice) > 0,
-                f"Cre / {source} cohort 가 비어 있습니다."
+            matrix.at[mouse, source] = hellinger(
+                p_reinj.loc[mouse], references[source]
             )
 
-            references[source] = p_cre.loc[source_mice].mean(axis=0)
+    rows = []
 
-        matrix = pd.DataFrame(
-            index=reinj_mice, columns=SOURCE_ORDER, dtype=float
-        )
+    for number, mouse in enumerate(reinj_mice, start=1):
 
-        for mouse in reinj_mice:
-            for source in SOURCE_ORDER:
-                matrix.at[mouse, source] = hellinger(
-                    p_reinj.loc[mouse], references[source]
-                )
+        matched = float(matrix.at[mouse, MATCHED_SOURCE])
 
-        matrices[scope] = matrix
+        mismatched = {
+            source: float(matrix.at[mouse, source])
+            for source in SOURCE_ORDER if source != MATCHED_SOURCE
+        }
 
-        for number, mouse in enumerate(reinj_mice, start=1):
+        nearest = min(mismatched, key=mismatched.get)
 
-            matched = float(matrix.at[mouse, MATCHED_SOURCE])
+        assigned = matrix.loc[mouse].idxmin()
 
-            mismatched = {
-                source: float(matrix.at[mouse, source])
-                for source in SOURCE_ORDER if source != MATCHED_SOURCE
-            }
-
-            nearest = min(mismatched, key=mismatched.get)
-
-            assigned = matrix.loc[mouse].idxmin()
-
-            rows.append(dict(
-                scope=scope,
-                n_features=len(shared),
-                mouse=mouse,
-                mouse_number=number,
-                matched_source=MATCHED_SOURCE,
-                H_matched=matched,
-                nearest_mismatched_source=nearest,
-                H_nearest_mismatched=mismatched[nearest],
-                margin=mismatched[nearest] - matched,
-                assigned_source=assigned,
-                correct=bool(assigned == MATCHED_SOURCE),
-                **{
-                    f"H_{source}": float(matrix.at[mouse, source])
-                    for source in SOURCE_ORDER
-                },
-            ))
+        rows.append(dict(
+            n_features=len(features),
+            mouse=mouse,
+            mouse_number=number,
+            matched_source=MATCHED_SOURCE,
+            H_matched=matched,
+            nearest_mismatched_source=nearest,
+            H_nearest_mismatched=mismatched[nearest],
+            margin=mismatched[nearest] - matched,
+            assigned_source=assigned,
+            correct=bool(assigned == MATCHED_SOURCE),
+            **{
+                f"H_{source}": float(matrix.at[mouse, source])
+                for source in SOURCE_ORDER
+            },
+        ))
 
     assignments = pd.DataFrame(rows)
 
@@ -2647,159 +2691,142 @@ def make_source_specificity(ctx, tables, show=None):
         out / "Reinj_source_specificity_assignments.csv", index=False
     )
 
-    pd.concat(
-        [
-            matrix.assign(scope=scope).reset_index(names="mouse")
-            for scope, matrix in matrices.items()
-        ],
-        ignore_index=True,
-    ).to_csv(
+    matrix.reset_index(names="mouse").to_csv(
         out / "Reinj_source_specificity_hellinger.csv", index=False
     )
-
-    scopes = list(sets)
 
     with rc():
 
         fig, axes = plt.subplots(
-            len(scopes), 2,
-            figsize=(
-                9.2,
-                len(scopes) * (1.15 * len(reinj_mice) + 1.85),
-            ),
+            1, 2,
+            figsize=(9.4, 1.15 * len(reinj_mice) + 3.4),
             gridspec_kw={"width_ratios": [1.25, 1.0]},
             squeeze=False,
         )
 
         fig.subplots_adjust(
-            left=0.14, right=0.95, top=0.88, bottom=0.12,
-            wspace=0.30, hspace=0.45,
+            left=0.14, right=0.95, top=0.82, bottom=0.17, wspace=0.30,
         )
 
-        for row, scope in enumerate(scopes):
+        ax = axes[0, 0]
 
-            matrix = matrices[scope]
+        image = ax.imshow(
+            matrix.to_numpy(dtype=float),
+            aspect="auto", cmap="viridis_r",
+            vmin=0, vmax=1, interpolation="nearest",
+        )
 
-            ax = axes[row, 0]
+        ax.set_xticks(range(len(SOURCE_ORDER)))
 
-            image = ax.imshow(
-                matrix.to_numpy(dtype=float),
-                aspect="auto", cmap="viridis_r",
-                vmin=0, vmax=1, interpolation="nearest",
-            )
+        ax.set_xticklabels(
+            [SOURCE_LABEL[s] for s in SOURCE_ORDER], fontsize=9
+        )
 
-            ax.set_xticks(range(len(SOURCE_ORDER)))
+        for tick, source in zip(ax.get_xticklabels(), SOURCE_ORDER):
+            tick.set_color(SOURCE_COLORS[source])
+            tick.set_fontweight("bold")
 
-            ax.set_xticklabels(
-                [SOURCE_LABEL[s] for s in SOURCE_ORDER], fontsize=9
-            )
+        ax.set_xlabel("Cre reference source", fontsize=10, labelpad=7)
 
-            for tick, source in zip(ax.get_xticklabels(), SOURCE_ORDER):
-                tick.set_color(SOURCE_COLORS[source])
-                tick.set_fontweight("bold")
+        ax.set_yticks(range(len(matrix)))
 
-            ax.set_xlabel("Cre reference source", fontsize=10, labelpad=7)
+        ax.set_yticklabels(
+            [f"Mouse {i + 1}" for i in range(len(matrix))], fontsize=9
+        )
 
-            ax.set_yticks(range(len(matrix)))
+        ax.set_ylabel("EV reinjection mice", fontsize=10, labelpad=8)
 
-            ax.set_yticklabels(
-                [f"Mouse {i + 1}" for i in range(len(matrix))], fontsize=9
-            )
+        matched_column = SOURCE_ORDER.index(MATCHED_SOURCE)
 
-            ax.set_ylabel("EV reinjection mice", fontsize=10, labelpad=8)
+        for i in range(len(matrix)):
 
-            matched_column = SOURCE_ORDER.index(MATCHED_SOURCE)
+            ax.add_patch(Rectangle(
+                (matched_column - 0.5, i - 0.5), 1, 1,
+                fill=False, edgecolor=MATCH_COLOR, linewidth=2,
+            ))
 
-            for i in range(len(matrix)):
+            for j in range(len(SOURCE_ORDER)):
 
-                ax.add_patch(Rectangle(
-                    (matched_column - 0.5, i - 0.5), 1, 1,
-                    fill=False, edgecolor=MATCH_COLOR, linewidth=2,
-                ))
+                value = float(matrix.iloc[i, j])
 
-                for j in range(len(SOURCE_ORDER)):
+                ax.text(
+                    j, i, f"{value:.2f}",
+                    ha="center", va="center", fontsize=8,
+                    color="white" if value > 0.55 else "black",
+                )
 
-                    value = float(matrix.iloc[i, j])
+        ax.set_title(
+            "Distance to Cre source references",
+            fontsize=11, fontweight="bold", pad=10,
+        )
 
-                    ax.text(
-                        j, i, f"{value:.2f}",
-                        ha="center", va="center", fontsize=8,
-                        color="white" if value > 0.55 else "black",
-                    )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
 
-            ax.set_title(
-                "Distance to Cre source references\n" + SCOPE_LABEL[scope],
-                fontsize=11, fontweight="bold", pad=10,
-            )
+        cbar = fig.colorbar(image, ax=ax, shrink=0.8, pad=0.03)
 
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
+        cbar.set_label("Hellinger distance", fontsize=9, labelpad=7)
 
-            cbar = fig.colorbar(image, ax=ax, shrink=0.8, pad=0.03)
+        cbar.ax.tick_params(labelsize=8)
 
-            cbar.set_label("Hellinger distance", fontsize=9, labelpad=7)
+        ax_bar = axes[0, 1]
 
-            cbar.ax.tick_params(labelsize=8)
+        margins = assignments["margin"].to_numpy(dtype=float)
 
-            ax_bar = axes[row, 1]
+        y = np.arange(len(margins))
 
-            subset = assignments.loc[
-                assignments.scope == scope
-            ].set_index("mouse").loc[matrix.index]
+        ax_bar.barh(
+            y, margins, height=0.5,
+            color=REINJ_COLOR, edgecolor="none", alpha=0.92, zorder=3,
+        )
 
-            margins = subset["margin"].to_numpy(dtype=float)
+        ax_bar.axvline(0, color="#555555", linewidth=1.0, zorder=4)
 
-            y = np.arange(len(margins))
+        half = max(float(np.max(np.abs(margins))) * 1.20, 0.05)
 
-            ax_bar.barh(
-                y, margins, height=0.5,
-                color=REINJ_COLOR, edgecolor="none", alpha=0.92, zorder=3,
-            )
+        ax_bar.set_xlim(-half, half)
 
-            ax_bar.axvline(0, color="#555555", linewidth=1.0, zorder=4)
+        ticks = np.linspace(-half, half, 5)
 
-            half = max(float(np.max(np.abs(margins))) * 1.20, 0.05)
+        ax_bar.set_xticks(ticks)
 
-            ax_bar.set_xlim(-half, half)
+        ax_bar.set_xticklabels([f"{t:.2f}" for t in ticks], fontsize=8)
 
-            ticks = np.linspace(-half, half, 5)
+        ax_bar.set_yticks(y)
+        ax_bar.set_yticklabels([])
+        ax_bar.tick_params(axis="y", length=0)
+        ax_bar.invert_yaxis()
 
-            ax_bar.set_xticks(ticks)
+        ax_bar.set_xlabel(
+            "ΔH (nearest mismatched − matched)", fontsize=10, labelpad=7
+        )
 
-            ax_bar.set_xticklabels(
-                [f"{t:.2f}" for t in ticks], fontsize=8
-            )
+        ax_bar.set_title(
+            "Source-reference specificity\n"
+            f"matched nearest in {int(assignments['correct'].sum())} / "
+            f"{len(assignments)} mice",
+            fontsize=11, fontweight="bold", pad=10,
+        )
 
-            ax_bar.set_yticks(y)
-            ax_bar.set_yticklabels([])
-            ax_bar.tick_params(axis="y", length=0)
-            ax_bar.invert_yaxis()
+        ax_bar.grid(axis="x", color="#ECEEEF", linewidth=0.65, zorder=0)
 
-            ax_bar.set_xlabel(
-                "ΔH (nearest mismatched − matched)",
-                fontsize=10, labelpad=7,
-            )
+        ax_bar.tick_params(
+            axis="x", length=3, width=0.6, color="#8D959A", pad=3
+        )
 
-            ax_bar.set_title(
-                "Source-reference specificity\n"
-                f"matched nearest in {int(subset['correct'].sum())} / "
-                f"{len(subset)} mice",
-                fontsize=11, fontweight="bold", pad=10,
-            )
+        ax_bar.spines["top"].set_visible(False)
+        ax_bar.spines["right"].set_visible(False)
+        ax_bar.spines["left"].set_visible(False)
+        ax_bar.spines["bottom"].set_color("#A0A5A8")
+        ax_bar.spines["bottom"].set_linewidth(0.7)
 
-            ax_bar.grid(
-                axis="x", color="#ECEEEF", linewidth=0.65, zorder=0
-            )
-
-            ax_bar.tick_params(
-                axis="x", length=3, width=0.6, color="#8D959A", pad=3
-            )
-
-            ax_bar.spines["top"].set_visible(False)
-            ax_bar.spines["right"].set_visible(False)
-            ax_bar.spines["left"].set_visible(False)
-            ax_bar.spines["bottom"].set_color("#A0A5A8")
-            ax_bar.spines["bottom"].set_linewidth(0.7)
+        fig.text(
+            0.5, 0.94,
+            "Shared feature space: union of all strict sources excluded\n"
+            f"{len(features)} features",
+            ha="center", va="center",
+            fontsize=10, fontfamily=RENDER_FONT,
+        )
 
         path = save_svg(
             fig, out / "Reinj_source_reference_specificity.svg", show
@@ -2808,35 +2835,30 @@ def make_source_specificity(ctx, tables, show=None):
     print()
     print(
         assignments[[
-            "scope", "mouse_number", "H_matched",
-            "nearest_mismatched_source", "H_nearest_mismatched",
-            "margin", "assigned_source", "correct",
+            "mouse_number", "H_matched", "nearest_mismatched_source",
+            "H_nearest_mismatched", "margin", "assigned_source", "correct",
         ]].to_string(index=False)
     )
 
     return dict(
-        svg=str(path), hellinger=matrices, assignments=assignments
+        svg=str(path), hellinger=matrix, assignments=assignments
     )
 
 
 # ============================================================
 # FIGURE 5  recipient-region enrichment + constrained permutation
+#
+# AllGrayMatter partition 자체가 서로 겹치지 않는 region 집합이므로
+# 그대로 permutation pool 로 사용합니다.
 # ============================================================
 
-def _candidates_for(pool, rid, log_tolerance, min_candidates):
-    """
-    한 target region 을 대체할 수 있는 region 후보.
-
-    같은 major division 안에서 log volume 차이가 tolerance 이내인
-    region 을 우선 사용하고, 후보가 부족하면 tolerance 를 넓힌 뒤
-    division 제약을 풉니다.
-    """
+def _candidates_for(pool, feature, log_tolerance, min_candidates):
 
     log_area = np.log(pool["area"].to_numpy(dtype=float))
 
     division = pool["division"].to_numpy()
 
-    position = pool.index.get_loc(rid)
+    position = pool.index.get_loc(feature)
 
     target_log_area = log_area[position]
 
@@ -2870,27 +2892,25 @@ def _candidates_for(pool, rid, log_tolerance, min_candidates):
 
 
 def _constrained_sets(
-    pool, target_ids, n_permutation, rng,
+    pool, target_features, n_permutation, rng,
     log_tolerance=np.log(2.0), min_candidates=8,
 ):
-
-    target_ids = list(target_ids)
 
     candidates = {}
     relaxation = {}
 
-    for rid in target_ids:
+    for feature in target_features:
 
         choices, how = _candidates_for(
-            pool, rid, log_tolerance, min_candidates
+            pool, feature, log_tolerance, min_candidates
         )
 
-        candidates[rid] = choices
-        relaxation[rid] = how
+        candidates[feature] = choices
+        relaxation[feature] = how
 
-    order = sorted(target_ids, key=lambda rid: len(candidates[rid]))
+    order = sorted(target_features, key=lambda f: len(candidates[f]))
 
-    everything = np.array(pool.index)
+    everything = list(pool.index)
 
     draws = []
     forced = 0
@@ -2899,10 +2919,10 @@ def _constrained_sets(
 
         used = set()
 
-        for rid in order:
+        for feature in order:
 
             available = [
-                candidate for candidate in candidates[rid]
+                candidate for candidate in candidates[feature]
                 if candidate not in used
             ]
 
@@ -2915,15 +2935,15 @@ def _constrained_sets(
                     if candidate not in used
                 ]
 
-            used.add(int(rng.choice(available)))
+            used.add(str(rng.choice(available)))
 
-        draws.append(np.array(sorted(used)))
+        draws.append(sorted(used))
 
     return draws, dict(
         relaxation=relaxation,
         n_candidates={
-            rid: int(len(choices))
-            for rid, choices in candidates.items()
+            feature: int(len(choices))
+            for feature, choices in candidates.items()
         },
         forced_draws=forced,
     )
@@ -2935,149 +2955,150 @@ def make_enrichment(ctx, tables, show=None):
 
     rng = np.random.default_rng(PERMUTATION_SEED)
 
-    pool, parents = leaf_pool(ctx, tables)
-
-    pool_ids = list(pool.index)
-
-    sets = region_sets(ctx)
+    space = load_feature_space(ctx, "AllGrayMatter")
 
     require(
-        "PredefinedM1" in sets,
-        "PredefinedM1 region set 을 만들 수 없습니다."
+        space is not None,
+        "primary/AllGrayMatter/ 결과가 없어 enrichment 분석을 할 수 "
+        "없습니다."
     )
 
-    m1_ids = set(sets["PredefinedM1"]["id"].astype(int))
+    features = space["features"]
 
-    target_ids = [
-        rid for rid in pool_ids
-        if rid in m1_ids or (set(_ancestors(rid, parents)) & m1_ids)
-    ]
+    count_reinj, area_reinj = apply_features(tables, features)
+
+    cre_count = fig1_table(ctx, "AllGrayMatter", "count")
 
     require(
-        len(target_ids) >= 3,
-        "broad region pool 안에 Figure 1 M1 recipient region 이 "
-        "3개 미만입니다."
+        cre_count is not None,
+        "primary/AllGrayMatter/Motor/count.csv 가 없습니다."
     )
 
-    draws, info = _constrained_sets(
-        pool, target_ids, N_PERMUTATION, rng
+    cre_mice = [m for m in cre_m1_mice(ctx) if m in cre_count.index]
+
+    divisions, parents = division_map(
+        ctx, features["region_id"].unique().tolist()
     )
 
-    print()
-    print("  permutation 제약:")
-
-    for rid in target_ids:
-        print(
-            f"    {pool.at[rid, 'acronym']}: "
-            f"{info['n_candidates'][rid]} candidates "
-            f"({info['relaxation'][rid]})"
-        )
-
-    if info["forced_draws"]:
-        print(f"    전체 pool 에서 강제로 뽑은 횟수: {info['forced_draws']}")
-
-    pd.DataFrame([
-        dict(
-            region_id=rid,
-            acronym=pool.at[rid, "acronym"],
-            division=pool.at[rid, "division"],
-            area=float(pool.at[rid, "area"]),
-            n_candidates=info["n_candidates"][rid],
-            constraint=info["relaxation"][rid],
-        )
-        for rid in target_ids
-    ]).to_csv(out / "Reinj_permutation_constraints.csv", index=False)
-
-    # --------------------------------------------------------
-    # hemisphere 별로 따로 계산
-    # --------------------------------------------------------
-
-    raw = ctx["raw"].set_index(["mouse", "id"])
-
-    units = []
-
-    for mouse, frame in tables.items():
-
-        sub = frame.loc[pool_ids]
-
-        for hemisphere, column in (("RH", "rh_count"), ("LH", "lh_count")):
-
-            units.append((
-                "Reinj", mouse, hemisphere,
-                sub[column].to_numpy(dtype=float),
-            ))
-
-    for mouse in cre_m1_mice(ctx):
-
-        sub = raw.xs(mouse).reindex(pool_ids)
-
-        side = str(
-            ctx["manifest"].at[mouse, "injection_side"]
-        ).strip().upper()
-
-        ipsi = "rh" if side == "R" else "lh"
-        contra = "lh" if side == "R" else "rh"
-
-        for hemisphere, key in (("ipsi", ipsi), ("contra", contra)):
-
-            units.append((
-                "Cre", mouse, hemisphere,
-                sub[f"{key}_count"].to_numpy(dtype=float),
-            ))
-
-    index_of = {rid: i for i, rid in enumerate(pool_ids)}
-
-    target_index = np.array([index_of[rid] for rid in target_ids])
-
-    draw_index = [
-        np.array([index_of[rid] for rid in draw]) for draw in draws
-    ]
+    m1_ids = set(predefined_m1_ids(ctx))
 
     records = []
     nulls = {}
+    constraint_rows = []
 
-    for group, mouse, hemisphere, counts in units:
+    for slot, hemisphere in (("s1", "ipsi"), ("s2", "contra")):
 
-        total = float(counts.sum())
+        subset = features.loc[features["hemisphere"] == hemisphere]
 
-        if total <= 0:
-
-            print(
-                f"  경고: {mouse} / {hemisphere} 의 pool 내 count 가 0 "
-                "이라 enrichment 를 계산하지 않습니다."
-            )
-
+        if subset.empty:
             continue
 
-        observed = float(counts[target_index].sum() / total)
+        area = area_reinj.loc[:, subset.index].mean(axis=0)
 
-        null = np.array([
-            float(counts[index].sum() / total) for index in draw_index
-        ])
+        pool = pd.DataFrame({
+            "label": subset["label"].to_numpy(),
+            "region_id": subset["region_id"].to_numpy(),
+            "division": [
+                divisions[int(rid)] for rid in subset["region_id"]
+            ],
+            "area": area.loc[subset.index].to_numpy(dtype=float),
+        }, index=subset.index)
 
-        records.append(dict(
-            group=group,
-            mouse=mouse,
-            hemisphere=hemisphere,
-            n_pool_regions=len(pool_ids),
-            n_target_regions=len(target_ids),
-            total_count=total,
-            target_count=float(counts[target_index].sum()),
-            enrichment=observed,
-            null_mean=float(null.mean()),
-            null_sd=float(null.std(ddof=1)),
-            null_p95=float(np.quantile(null, 0.95)),
-            enrichment_over_null=(
-                observed / null.mean() if null.mean() > 0 else np.nan
-            ),
-            permutation_p=float(
-                (1 + np.sum(null >= observed)) / (len(null) + 1)
-            ),
-            n_permutation=len(null),
-        ))
+        pool = pool.loc[pool["area"] > AREA_ATOL]
 
-        if group == "Reinj":
-            nulls[(mouse, hemisphere)] = null
+        require(
+            len(pool) > 10,
+            f"{hemisphere}: permutation pool 이 10개 미만입니다."
+        )
+
+        target = [
+            feature for feature in pool.index
+            if int(pool.at[feature, "region_id"]) in m1_ids
+            or (
+                set(_ancestors(int(pool.at[feature, "region_id"]), parents))
+                & m1_ids
+            )
+        ]
+
+        require(
+            len(target) >= 3,
+            f"{hemisphere}: pool 안의 Figure 1 M1 recipient region 이 "
+            "3개 미만입니다."
+        )
+
+        draws, info = _constrained_sets(
+            pool, target, N_PERMUTATION, rng
+        )
+
+        for feature in target:
+
+            constraint_rows.append(dict(
+                hemisphere=hemisphere,
+                feature=feature,
+                label=pool.at[feature, "label"],
+                division=pool.at[feature, "division"],
+                area=float(pool.at[feature, "area"]),
+                n_candidates=info["n_candidates"][feature],
+                constraint=info["relaxation"][feature],
+            ))
+
+        units = [
+            ("Reinj", mouse, count_reinj.loc[mouse, pool.index])
+            for mouse in tables
+        ]
+
+        units += [
+            ("Cre", mouse, cre_count.loc[mouse, pool.index])
+            for mouse in cre_mice
+        ]
+
+        for group, mouse, counts in units:
+
+            counts = counts.astype(float)
+
+            total = float(counts.sum())
+
+            if total <= 0:
+                print(
+                    f"  경고: {mouse} / {hemisphere} 의 count 합이 0 "
+                    "이라 enrichment 를 계산하지 않습니다."
+                )
+                continue
+
+            observed = float(counts.loc[target].sum() / total)
+
+            null = np.array([
+                float(counts.loc[draw].sum() / total) for draw in draws
+            ])
+
+            records.append(dict(
+                group=group,
+                mouse=mouse,
+                hemisphere=(
+                    SLOT_LABEL["Reinj"][slot]
+                    if group == "Reinj"
+                    else SLOT_LABEL["Cre"][slot]
+                ),
+                slot=slot,
+                n_pool_features=len(pool),
+                n_target_features=len(target),
+                total_count=total,
+                target_count=float(counts.loc[target].sum()),
+                enrichment=observed,
+                null_mean=float(null.mean()),
+                null_sd=float(null.std(ddof=1)),
+                null_p95=float(np.quantile(null, 0.95)),
+                enrichment_over_null=(
+                    observed / null.mean() if null.mean() > 0 else np.nan
+                ),
+                permutation_p=float(
+                    (1 + np.sum(null >= observed)) / (len(null) + 1)
+                ),
+                n_permutation=len(null),
+            ))
+
+            if group == "Reinj":
+                nulls[(mouse, slot)] = null
 
     enrichment_df = pd.DataFrame(records)
 
@@ -3085,36 +3106,26 @@ def make_enrichment(ctx, tables, show=None):
         out / "Reinj_recipient_region_enrichment.csv", index=False
     )
 
-    pool.reset_index().to_csv(
-        out / "Reinj_permutation_region_pool.csv", index=False
+    pd.DataFrame(constraint_rows).to_csv(
+        out / "Reinj_permutation_constraints.csv", index=False
     )
 
     reinj_mice = list(tables)
 
-    hemispheres = ["RH", "LH"]
-
     cre_mean = {
-        "ipsi": enrichment_df.loc[
+        slot: enrichment_df.loc[
             (enrichment_df.group == "Cre")
-            & (enrichment_df.hemisphere == "ipsi"), "enrichment"
-        ].mean(),
-        "contra": enrichment_df.loc[
-            (enrichment_df.group == "Cre")
-            & (enrichment_df.hemisphere == "contra"), "enrichment"
-        ].mean(),
+            & (enrichment_df.slot == slot), "enrichment"
+        ].mean()
+        for slot in SLOTS
     }
-
-    reference_for = {"RH": "ipsi", "LH": "contra"}
-
-    if ORIENTATION == "rh_to_contra":
-        reference_for = {"RH": "contra", "LH": "ipsi"}
 
     with rc():
 
         fig, axes = plt.subplots(
-            len(hemispheres), len(reinj_mice),
-            figsize=(3.3 * len(reinj_mice) + 0.4, 2.9 * len(hemispheres) + 1.0),
-            sharey=False, squeeze=False,
+            len(SLOTS), len(reinj_mice),
+            figsize=(3.3 * len(reinj_mice) + 0.4, 2.9 * len(SLOTS) + 1.0),
+            squeeze=False,
         )
 
         fig.subplots_adjust(
@@ -3122,23 +3133,21 @@ def make_enrichment(ctx, tables, show=None):
             wspace=0.18, hspace=0.45,
         )
 
-        for row, hemisphere in enumerate(hemispheres):
+        for row, slot in enumerate(SLOTS):
 
             for col, mouse in enumerate(reinj_mice):
 
                 ax = axes[row, col]
 
-                key = (mouse, hemisphere)
-
-                if key not in nulls:
+                if (mouse, slot) not in nulls:
                     ax.set_visible(False)
                     continue
 
-                null = nulls[key]
+                null = nulls[(mouse, slot)]
 
                 record = enrichment_df.loc[
                     (enrichment_df.mouse == mouse)
-                    & (enrichment_df.hemisphere == hemisphere)
+                    & (enrichment_df.slot == slot)
                 ].iloc[0]
 
                 ax.hist(
@@ -3151,18 +3160,16 @@ def make_enrichment(ctx, tables, show=None):
                     color=REINJ_COLOR, linewidth=2.0, zorder=4,
                 )
 
-                cre_value = cre_mean[reference_for[hemisphere]]
-
-                if np.isfinite(cre_value):
+                if np.isfinite(cre_mean[slot]):
 
                     ax.axvline(
-                        cre_value,
+                        cre_mean[slot],
                         color=SOURCE_COLORS[MATCHED_SOURCE],
                         linewidth=1.6, linestyle="--", zorder=3,
                     )
 
                 ax.set_title(
-                    f"Mouse {col + 1} · {hemisphere}\n"
+                    f"Mouse {col + 1} · {SLOT_LABEL['Reinj'][slot]}\n"
                     f"enrichment = {record['enrichment']:.3f}, "
                     f"p = {record['permutation_p']:.4f}",
                     fontsize=9.5, fontfamily=RENDER_FONT, pad=6,
@@ -3196,8 +3203,8 @@ def make_enrichment(ctx, tables, show=None):
         fig.text(
             0.5, 0.955,
             "Recipient-region enrichment vs constrained region permutation\n"
-            f"{len(target_ids)} target regions out of {len(pool_ids)} "
-            f"non-overlapping regions, {N_PERMUTATION} permutations",
+            f"{N_PERMUTATION} permutations, "
+            "major division and region volume preserved",
             ha="center", va="center",
             fontsize=11, fontfamily=RENDER_FONT, fontweight="bold",
         )
@@ -3230,10 +3237,7 @@ def make_enrichment(ctx, tables, show=None):
         ]].to_string(index=False)
     )
 
-    return dict(
-        svg=str(path), enrichment=enrichment_df,
-        pool=pool, target_ids=target_ids,
-    )
+    return dict(svg=str(path), enrichment=enrichment_df)
 
 
 # ============================================================
@@ -3244,69 +3248,58 @@ def make_reference_model(ctx, tables, show=None):
 
     out = ctx["output"]
 
-    pool, _ = leaf_pool(ctx, tables)
+    space = load_feature_space(ctx, "AllGrayMatter")
 
-    pool_ids = list(pool.index)
+    require(
+        space is not None,
+        "primary/AllGrayMatter/ 결과가 없어 count model 을 실행할 수 "
+        "없습니다."
+    )
 
-    cre_mice = cre_m1_mice(ctx)
+    features = space["features"]
 
-    # Figure 1 reference: mouse 별 p 를 구한 뒤 동일 weight 평균
-    p_cre = to_p(fig1_density(ctx, pool_ids, mode="lateralized"))
+    p_fig1 = space["p"]
 
-    reference = p_cre.loc[cre_mice].mean(axis=0)
+    cre_mice = [m for m in cre_m1_mice(ctx) if m in p_fig1.index]
+
+    reference = p_fig1.loc[cre_mice].mean(axis=0)
+
+    count, area = apply_features(tables, features)
 
     positive = reference[reference > 0]
 
     require(
         len(positive) >= 10,
-        "Cre M1 reference 에서 0보다 큰 feature 가 10개 미만입니다."
+        "Cre M1 reference 에서 0 보다 큰 feature 가 10개 미만입니다."
     )
 
     floor = float(positive.min()) / 2.0
 
-    slot_for = {"RH": "s1", "LH": "s2"}
-
-    if ORIENTATION == "rh_to_contra":
-        slot_for = {"RH": "s2", "LH": "s1"}
-
     rows = []
 
-    for mouse, frame in tables.items():
+    for mouse in tables:
 
-        sub = frame.loc[pool_ids]
-
-        for hemisphere in ("RH", "LH"):
-
-            slot = slot_for[hemisphere]
-
-            available = [
-                rid for rid in pool_ids
-                if (slot, rid) in set(reference.index)
-            ]
-
-            values = reference.loc[[(slot, rid) for rid in available]]
-
-            rows.append(pd.DataFrame({
-                "mouse": mouse,
-                "hemisphere": hemisphere,
-                "region_id": available,
-                "acronym": pool.loc[available, "acronym"].to_numpy(),
-                "count": sub.loc[
-                    available, f"{hemisphere.lower()}_count"
-                ].to_numpy(dtype=float),
-                "area": sub.loc[
-                    available, f"{hemisphere.lower()}_area"
-                ].to_numpy(dtype=float),
-                "reference_p": values.to_numpy(dtype=float),
-            }))
+        rows.append(pd.DataFrame({
+            "mouse": mouse,
+            "feature": features.index,
+            "hemisphere": features["hemisphere"].to_numpy(),
+            "label": features["label"].to_numpy(),
+            "count": count.loc[mouse].to_numpy(dtype=float),
+            "area": area.loc[mouse].to_numpy(dtype=float),
+            "reference_p": reference.reindex(
+                features.index
+            ).to_numpy(dtype=float),
+        }))
 
     data = pd.concat(rows, ignore_index=True)
+
+    data = data.loc[
+        (data["area"] > AREA_ATOL) & data["reference_p"].notna()
+    ].copy()
 
     data["log_reference_p"] = np.log(
         data["reference_p"].clip(lower=floor)
     )
-
-    data = data.loc[data["area"] > AREA_ATOL].copy()
 
     data["observed_density"] = data["count"] / data["area"]
 
@@ -3321,8 +3314,8 @@ def make_reference_model(ctx, tables, show=None):
             data["mouse"] == mouse
         ).astype(float).to_numpy()
 
-    design["hemisphere[LH]"] = (
-        data["hemisphere"] == "LH"
+    design["hemisphere[contra]"] = (
+        data["hemisphere"] == "contra"
     ).astype(float).to_numpy()
 
     design = sm.add_constant(design, has_constant="add")
@@ -3369,24 +3362,25 @@ def make_reference_model(ctx, tables, show=None):
 
     for mouse in mouse_list:
 
-        for hemisphere in ("RH", "LH"):
+        for hemisphere in ("ipsi", "contra"):
 
-            sub = data.loc[
+            subset = data.loc[
                 (data.mouse == mouse) & (data.hemisphere == hemisphere)
             ]
 
-            if sub.empty:
+            if subset.empty:
                 continue
 
             per_unit.append(dict(
                 mouse=mouse,
-                hemisphere=hemisphere,
-                n_regions=len(sub),
+                reinjection_side=reinj_side_for(hemisphere).upper(),
+                cre_hemisphere=hemisphere,
+                n_features=len(subset),
                 spearman_rho=spearman_rho(
-                    sub["reference_p"].to_numpy(),
-                    sub["observed_density"].to_numpy(),
+                    subset["reference_p"].to_numpy(),
+                    subset["observed_density"].to_numpy(),
                 ),
-                fraction_nonzero=float((sub["count"] > 0).mean()),
+                fraction_nonzero=float((subset["count"] > 0).mean()),
             ))
 
     per_unit_df = pd.DataFrame(per_unit)
@@ -3394,7 +3388,7 @@ def make_reference_model(ctx, tables, show=None):
     summary = pd.DataFrame([dict(
         model=model_name,
         n_observations=int(len(data)),
-        n_regions=int(data.region_id.nunique()),
+        n_features=int(data.feature.nunique()),
         n_mice=len(mouse_list),
         coefficient_log_reference_p=coefficient,
         standard_error=standard_error,
@@ -3427,32 +3421,32 @@ def make_reference_model(ctx, tables, show=None):
 
         fig, axes = plt.subplots(
             2, len(mouse_list),
-            figsize=(3.3 * len(mouse_list) + 0.4, 6.6),
+            figsize=(3.3 * len(mouse_list) + 0.6, 6.6),
             sharex=True, sharey=True, squeeze=False,
         )
 
         fig.subplots_adjust(
-            left=0.095, right=0.985, top=0.84, bottom=0.12,
+            left=0.11, right=0.985, top=0.84, bottom=0.12,
             wspace=0.14, hspace=0.32,
         )
 
-        for row, hemisphere in enumerate(("RH", "LH")):
+        for row, hemisphere in enumerate(("ipsi", "contra")):
 
             for col, mouse in enumerate(mouse_list):
 
                 ax = axes[row, col]
 
-                sub = data.loc[
+                subset = data.loc[
                     (data.mouse == mouse)
                     & (data.hemisphere == hemisphere)
                 ]
 
-                if sub.empty:
+                if subset.empty:
                     ax.set_visible(False)
                     continue
 
-                x = sub["reference_p"].to_numpy(dtype=float)
-                y = sub["observed_density"].to_numpy(dtype=float)
+                x = subset["reference_p"].to_numpy(dtype=float)
+                y = subset["observed_density"].to_numpy(dtype=float)
 
                 shown = (x > 0) & (y > 0)
 
@@ -3477,12 +3471,14 @@ def make_reference_model(ctx, tables, show=None):
 
                 rho = per_unit_df.loc[
                     (per_unit_df.mouse == mouse)
-                    & (per_unit_df.hemisphere == hemisphere),
+                    & (per_unit_df.cre_hemisphere == hemisphere),
                     "spearman_rho",
                 ].iloc[0]
 
+                side = reinj_side_for(hemisphere).upper()
+
                 ax.set_title(
-                    f"Mouse {col + 1} · {hemisphere}\n"
+                    f"Mouse {col + 1} · {side}\n"
                     + (
                         f"ρ = {rho:.2f}"
                         if np.isfinite(rho) else "ρ = NA"
@@ -3504,7 +3500,7 @@ def make_reference_model(ctx, tables, show=None):
 
                 if col == 0:
                     ax.set_ylabel(
-                        "Reinjection density\n(cells / area)",
+                        f"Reinjection density\n({hemisphere} slot)",
                         fontsize=9.5, fontfamily=RENDER_FONT,
                     )
 
@@ -3543,8 +3539,7 @@ def make_reference_model(ctx, tables, show=None):
 # FIGURE 7  signal / coverage / laterality QC
 #
 # negative control 데이터가 없으므로 (a) 는
-# "signal > negative control" 검정이 아니라 두 group 의 절대량
-# 비교입니다.
+# "signal > negative control" 검정이 아니라 절대량 비교입니다.
 # ============================================================
 
 TOP_N = 10
@@ -3554,30 +3549,51 @@ def make_qc(ctx, tables, show=None):
 
     out = ctx["output"]
 
-    pool, _ = leaf_pool(ctx, tables)
+    space = load_feature_space(ctx, "AllGrayMatter")
 
-    pool_ids = list(pool.index)
+    require(
+        space is not None,
+        "primary/AllGrayMatter/ 결과가 없어 QC 를 실행할 수 없습니다."
+    )
 
-    raw = ctx["raw"].set_index(["mouse", "id"])
+    features = space["features"]
+
+    ipsi = features.index[features["hemisphere"] == "ipsi"]
+    contra = features.index[features["hemisphere"] == "contra"]
+
+    count_reinj, area_reinj = apply_features(tables, features)
+
+    cre_count = fig1_table(ctx, "AllGrayMatter", "count")
+    cre_area = fig1_table(ctx, "AllGrayMatter", "area")
+
+    require(
+        cre_count is not None and cre_area is not None,
+        "primary/AllGrayMatter/Motor/count.csv, area.csv 가 없습니다."
+    )
+
+    cre_mice = [m for m in cre_m1_mice(ctx) if m in cre_count.index]
 
     records = []
     curves = {}
 
-    def add_unit(group, label, counts, areas, first, second):
+    def add_unit(group, label, counts, areas):
 
-        total = float(np.nansum(counts))
+        counts = counts.astype(float)
+        areas = areas.astype(float)
 
-        require(total > 0, f"{label}: 분석 region 전체 count 가 0 입니다.")
+        total = float(counts.sum())
 
-        density = np.where(
-            areas > AREA_ATOL,
-            counts / np.where(areas > AREA_ATOL, areas, np.nan),
-            np.nan,
+        require(total > 0, f"{label}: 분석 feature 전체 count 가 0 입니다.")
+
+        present = areas > AREA_ATOL
+
+        density = np.zeros(len(counts), dtype=float)
+
+        density[present.to_numpy()] = (
+            counts[present].to_numpy() / areas[present].to_numpy()
         )
 
-        p = np.nan_to_num(density, nan=0.0)
-
-        p = p / p.sum()
+        p = density / density.sum()
 
         order = np.sort(p)[::-1]
 
@@ -3586,45 +3602,31 @@ def make_qc(ctx, tables, show=None):
         records.append(dict(
             group=group,
             label=label,
-            n_regions=len(pool_ids),
+            n_features=len(counts),
             total_count=total,
-            n_regions_with_signal=int(np.sum(counts > 0)),
-            coverage=float(np.mean(counts > 0)),
-            top_region_share=float(order[0]),
+            n_features_with_signal=int((counts > 0).sum()),
+            coverage=float((counts > 0).mean()),
+            top_feature_share=float(order[0]),
             top_n_share=float(order[:TOP_N].sum()),
-            laterality_index=float(np.nansum(first) / total),
-            second_side_count=float(np.nansum(second)),
+            laterality_index=float(
+                counts.loc[[c for c in ipsi if c in counts.index]].sum()
+                / total
+            ),
         ))
 
-    for mouse, frame in tables.items():
-
-        sub = frame.loc[pool_ids]
+    for mouse in tables:
 
         add_unit(
             "Reinj", mouse,
-            (sub["rh_count"] + sub["lh_count"]).to_numpy(float),
-            (sub["rh_area"] + sub["lh_area"]).to_numpy(float),
-            sub["rh_count"].to_numpy(float),
-            sub["lh_count"].to_numpy(float),
+            count_reinj.loc[mouse], area_reinj.loc[mouse],
         )
 
-    for mouse in cre_m1_mice(ctx):
-
-        sub = raw.xs(mouse).reindex(pool_ids)
-
-        side = str(
-            ctx["manifest"].at[mouse, "injection_side"]
-        ).strip().upper()
-
-        ipsi = "rh" if side == "R" else "lh"
-        contra = "lh" if side == "R" else "rh"
+    for mouse in cre_mice:
 
         add_unit(
             "Cre", mouse,
-            (sub[f"{ipsi}_count"] + sub[f"{contra}_count"]).to_numpy(float),
-            (sub[f"{ipsi}_area"] + sub[f"{contra}_area"]).to_numpy(float),
-            sub[f"{ipsi}_count"].to_numpy(float),
-            sub[f"{contra}_count"].to_numpy(float),
+            cre_count.loc[mouse, features.index],
+            cre_area.loc[mouse, features.index],
         )
 
     qc = pd.DataFrame(records)
@@ -3651,6 +3653,9 @@ def make_qc(ctx, tables, show=None):
             for index, group in enumerate(groups):
 
                 values = qc.loc[qc.group == group, column].to_numpy(float)
+
+                if len(values) == 0:
+                    continue
 
                 x = (
                     np.array([float(index)])
@@ -3684,7 +3689,8 @@ def make_qc(ctx, tables, show=None):
             ax.set_xticklabels(
                 [
                     f"AAV-Cre M1\n(n = {int((qc.group == 'Cre').sum())})",
-                    f"EV reinjection\n(n = {int((qc.group == 'Reinj').sum())})",
+                    "EV reinjection\n"
+                    f"(n = {int((qc.group == 'Reinj').sum())})",
                 ],
                 fontsize=8.3, fontfamily=RENDER_FONT,
             )
@@ -3709,7 +3715,7 @@ def make_qc(ctx, tables, show=None):
 
         strip(
             axes[0, 0], "total_count", log=True,
-            ylabel="tdTomato+ cells in analyzed regions",
+            ylabel="tdTomato+ cells in analyzed features",
         )
 
         axes[0, 0].set_title(
@@ -3718,7 +3724,7 @@ def make_qc(ctx, tables, show=None):
 
         strip(
             axes[0, 1], "coverage",
-            ylabel="Fraction of regions with ≥ 1 cell",
+            ylabel="Fraction of features with ≥ 1 cell",
         )
 
         axes[0, 1].set_ylim(-0.03, 1.03)
@@ -3746,7 +3752,7 @@ def make_qc(ctx, tables, show=None):
         )
 
         ax.set_xlabel(
-            "Number of regions (ranked)",
+            "Number of features (ranked)",
             fontsize=9.5, fontfamily=RENDER_FONT,
         )
 
@@ -3774,7 +3780,8 @@ def make_qc(ctx, tables, show=None):
 
         strip(
             axes[0, 3], "laterality_index", hline=0.5,
-            ylabel="Cre: ipsi / total   ·   Reinj: RH / total",
+            ylabel="Cre: ipsi / total   ·   Reinj: "
+                   f"{reinj_side_for('ipsi').upper()} / total",
         )
 
         axes[0, 3].set_ylim(0, 1.03)
@@ -3786,7 +3793,7 @@ def make_qc(ctx, tables, show=None):
         fig.text(
             0.5, 0.955,
             "Signal, coverage and laterality QC   "
-            f"({len(pool_ids)} non-overlapping regions)",
+            f"({len(features)} all-gray-matter features)",
             ha="center", va="center",
             fontsize=11.5, fontfamily=RENDER_FONT, fontweight="bold",
         )
@@ -3805,10 +3812,6 @@ def make_qc(ctx, tables, show=None):
 
     return dict(svg=str(path), qc=qc)
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 def diagnose(run_dir=None):
     """
@@ -3905,6 +3908,8 @@ def diagnose(run_dir=None):
         except Exception as error:  # noqa: BLE001
             print(f"  config.json 확인 실패: {error}")
 
+        ctx_run = dict(run=run)
+
         agm = (
             run / "primary" / "AllGrayMatter" / MATCHED_SOURCE
             / "feature_definitions.csv"
@@ -3917,8 +3922,27 @@ def diagnose(run_dir=None):
             except Exception as error:  # noqa: BLE001
                 print(f"  feature_definitions.csv 읽기 실패: {error}")
         else:
-            print("  feature_definitions.csv: 없음 "
-                  "(AllGrayMatter scope 는 건너뜁니다)")
+            print(f"  없음: {agm}")
+
+        for scope in SCOPES + [SPECIFICITY_SCOPE]:
+
+            definition_path, p_path = _space_paths(ctx_run, scope)
+
+            if not (definition_path.is_file() and p_path.is_file()):
+                print(f"  feature space {scope}: 없음 ({definition_path})")
+                continue
+
+            try:
+
+                frame = pd.read_csv(p_path, index_col=0)
+
+                print(
+                    f"  feature space {scope}: {frame.shape[1]} features, "
+                    f"mice {list(frame.index)}"
+                )
+
+            except Exception as error:  # noqa: BLE001
+                print(f"  feature space {scope} 읽기 실패: {error}")
 
     # ----------------------------------------------------
     # 3. reinjection 파일
@@ -3931,42 +3955,57 @@ def diagnose(run_dir=None):
 
         print(f"  {mouse}: {root}")
 
-        results = Path(root).expanduser() / RESULTS_SUBDIR
+        directory, tried = reinj_results_directory(root)
 
-        if not results.is_dir():
-            print(f"    폴더 없음: {results}")
+        if directory is None:
+            print("    results 폴더 없음. 확인한 경로:")
+            for path in tried:
+                print(f"      {path}")
             continue
 
-        for template, side in (
-            (RH_FILE_TEMPLATE, "rh"),
-            (WHOLE_FILE_TEMPLATE, "whole"),
-        ):
+        print(f"    results 폴더: {directory}")
+
+        for hemi in ("whole", "rh"):
+
+            files = [
+                directory / FILE_TEMPLATE.format(
+                    prefix=REINJ_PREFIX, hemi=hemi, level=level
+                )
+                for level in LEVELS
+            ]
 
             missing = [
-                level for level in LEVELS
-                if not (results / template.format(level=level)).is_file()
+                level for level, path in zip(LEVELS, files)
+                if not path.is_file()
             ]
 
             if missing:
-                print(
-                    f"    {side}: lvl {missing} 파일 없음"
+
+                print(f"    {hemi}: lvl {missing} 파일 없음")
+
+                others = sorted(
+                    {
+                        path.name.split("_" + hemi + "_")[0]
+                        for path in directory.glob("*_" + hemi + "_lvl*.csv")
+                    }
                 )
 
-            sample = results / template.format(level=LEVELS[0])
+                if others:
+                    print(f"      이 폴더에 있는 prefix: {others}")
 
-            if sample.is_file():
+            if files[0].is_file():
 
                 try:
 
-                    frame = pd.read_csv(sample)
+                    frame = pd.read_csv(files[0], encoding="utf-8-sig")
 
                     print(
-                        f"    {side} lvl{LEVELS[0]}: "
+                        f"    {hemi} lvl{LEVELS[0]}: "
                         f"{len(frame)} rows, {list(frame.columns)}"
                     )
 
                 except Exception as error:  # noqa: BLE001
-                    print(f"    {side} 읽기 실패: {error}")
+                    print(f"    {hemi} 읽기 실패: {error}")
 
     # ----------------------------------------------------
     # 4. 실제 로딩
@@ -3991,8 +4030,9 @@ def diagnose(run_dir=None):
         for mouse, frame in tables.items():
             print(
                 f"  {mouse}: {len(frame)} regions, "
-                f"total rh {frame['rh_count'].sum():.0f} / "
-                f"whole {frame['whole_count'].sum():.0f}"
+                f"whole count {frame['whole_count'].sum():.0f} "
+                f"(rh {frame['rh_count'].sum():.0f} / "
+                f"lh {frame['lh_count'].sum():.0f})"
             )
     except Exception:  # noqa: BLE001
         print("  reinjection 로딩 실패:")
@@ -4000,38 +4040,52 @@ def diagnose(run_dir=None):
 
     if ctx is not None and tables is not None:
 
-        try:
+        reinj_ids = set.intersection(*[
+            set(table.index.astype(int)) for table in tables.values()
+        ])
 
-            sets = region_sets(ctx)
+        for scope in SCOPES + [SPECIFICITY_SCOPE]:
 
-            for scope, frame in sets.items():
+            try:
 
-                ids = frame["id"].tolist()
+                space = load_feature_space(ctx, scope)
 
-                fig1_ids = set(ctx["raw"].id.astype(int))
+                if space is None:
+                    continue
 
-                reinj_ids = set.intersection(*[
-                    set(table.index.astype(int))
-                    for table in tables.values()
-                ])
+                features = space["features"]
+
+                needed = set(features["region_id"].astype(int))
+
+                for ids in features["subtract_ids"]:
+                    needed.update(int(i) for i in ids)
+
+                missing = sorted(needed - reinj_ids)
 
                 print(
-                    f"  {scope}: {len(ids)} regions, "
-                    f"Figure 1 에 있음 {len(set(ids) & fig1_ids)}, "
-                    f"reinjection 에 있음 {len(set(ids) & reinj_ids)}"
+                    f"  {scope}: {len(features)} features, "
+                    f"region id {len(needed)}개 중 "
+                    f"reinjection 에 없는 것 {len(missing)}개"
                 )
 
-                missing = sorted(set(ids) - reinj_ids)
-
                 if missing:
-                    print(
-                        f"      reinjection 파일에 없는 region id: "
-                        f"{missing[:20]}"
+                    print(f"      {missing[:20]}")
+
+                else:
+
+                    p_cre, p_reinj, shared = common_feature_space(
+                        ctx, tables, space
                     )
 
-        except Exception:  # noqa: BLE001
-            print("  region set 확인 실패:")
-            traceback.print_exc()
+                    print(
+                        f"      공통 feature {len(shared)}개, "
+                        f"Figure 1 mice {len(p_cre)}, "
+                        f"reinjection mice {len(p_reinj)}"
+                    )
+
+            except Exception:  # noqa: BLE001
+                print(f"  {scope} 확인 실패:")
+                traceback.print_exc()
 
     print()
     print("==========================================")
