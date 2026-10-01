@@ -16,12 +16,29 @@ Figure 1 run 폴더(`FIG1_RUN_DIR`)는 비워 두면 자동으로 찾습니다.
    `RUN_DIR`, `SCATTER_RUN_DIR`, `HELLINGER_RUN_DIR`).
    `Figure_list` 경로를 들고 있어도 옆의 `run_...` 을 찾습니다.
 2. `SEARCH_ROOTS` · reinjection path · 현재 폴더 · home 아래에서
-   `SELECT_outputs/run_*` 중 `RUN_STATUS.json` 이 completed 인 폴더를
-   탐색하여 가장 최근 것을 사용하고, 다른 후보도 함께 출력합니다.
+   `run_*` 폴더를 탐색합니다.
 
-둘 다 실패하면 어떤 변수와 어떤 폴더를 찾아봤는지 출력하므로,
-`FIG1_RUN_DIR` 에 경로를 직접 적거나 `SEARCH_ROOTS` 에 상위 폴더를
-추가하시면 됩니다.
+찾은 run 은 **폴더 이름이 아니라 내용으로** 검증합니다.
+
+- `RUN_STATUS.json` 이 completed
+- 필요한 CSV 7개가 모두 존재
+- cohort 의 `Cre` group 에 M1 / dHP / S1 / PFC 가 모두 존재
+
+조건을 만족하는 run 이 하나면 그것을 쓰고(어떤 cohort 구성인지 함께 출력),
+여러 개면 **자동으로 고르지 않고 멈춘 뒤** 후보 목록을 출력합니다.
+GFP-hue 처럼 source 구성이 다른 분석의 run 은 제외되며 이유가 출력됩니다.
+
+`FIG1_RUN_DIR` 을 직접 지정하신 경우에도 같은 검증을 거칩니다.
+
+### 문제가 생기면
+
+```python
+diagnose()
+```
+
+run 폴더 후보와 각각의 cohort 구성·제외 사유, 선택된 run 의 CSV column,
+reinjection lvl 파일의 column 과 row 수, region id 매칭 상태를 출력합니다.
+figure 는 만들지 않습니다.
 
 Figure 포맷/스타일(Arial, SVG only, √p, source color, ρ·H 표기)은 기존
 Figure 1 코드들과 동일합니다.

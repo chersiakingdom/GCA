@@ -680,6 +680,145 @@ def _as_run_dir(value):
     return None
 
 
+REQUIRED_FILES = [
+    "config.json",
+    "RUN_STATUS.json",
+    "input_manifest.csv",
+    "raw_readout_regions.csv",
+    "off_source_counts.csv",
+    "predefined_recipient_regions.csv",
+    "source_region_definition.csv",
+]
+
+
+def run_summary(path):
+    """run 폴더가 어떤 분석인지 요약합니다."""
+
+    path = Path(path)
+
+    summary = dict(
+        path=path,
+        name=path.name,
+        groups={},
+        missing_files=[
+            name for name in REQUIRED_FILES
+            if not (path / name).is_file()
+        ],
+    )
+
+    try:
+        saved = json.loads(
+            (path / "config.json").read_text(encoding="utf-8")
+        )
+        cohorts = saved.get("cohorts", {})
+    except (OSError, ValueError, KeyError):
+        return summary
+
+    summary["groups"] = {
+        group: {
+            source: len(mice)
+            for source, mice in sources.items()
+        }
+        for group, sources in cohorts.items()
+        if isinstance(sources, dict)
+    }
+
+    return summary
+
+
+def describe_run(summary):
+
+    groups = summary["groups"]
+
+    if not groups:
+        return "cohort 정보 없음"
+
+    return " | ".join(
+        group
+        + ": "
+        + ", ".join(
+            f"{SOURCE_LABEL.get(source, source)} n={n}"
+            for source, n in sources.items()
+        )
+        for group, sources in groups.items()
+    )
+
+
+def check_run(path):
+    """
+    이 분석(AAV-Cre M1 vs reinjection)에 쓸 수 있는 run 폴더인지
+    내용으로 확인합니다.
+
+    returns (ok, reason, summary)
+    """
+
+    path = Path(path)
+
+    if not is_run_dir(path):
+        return False, "완료된 run 폴더가 아님", run_summary(path)
+
+    summary = run_summary(path)
+
+    if summary["missing_files"]:
+        return (
+            False,
+            "파일 없음: " + ", ".join(summary["missing_files"]),
+            summary,
+        )
+
+    cre = summary["groups"].get("Cre")
+
+    if not cre:
+        return (
+            False,
+            "cohort 에 Cre group 이 없음 "
+            f"(있는 group: {list(summary['groups'])})",
+            summary,
+        )
+
+    missing_sources = [
+        source for source in SOURCE_ORDER
+        if not cre.get(source)
+    ]
+
+    if missing_sources:
+        return (
+            False,
+            "Cre cohort 에 source 가 없음: "
+            + ", ".join(
+                SOURCE_LABEL.get(s, s) for s in missing_sources
+            )
+            + f" (있는 source: {list(cre)})",
+            summary,
+        )
+
+    try:
+
+        presets = pd.read_csv(path / "predefined_recipient_regions.csv")
+
+        if not (presets.source == MATCHED_SOURCE).any():
+            return (
+                False,
+                "predefined_recipient_regions.csv 에 "
+                f"{MATCHED_SOURCE} recipient region 이 없음",
+                summary,
+            )
+
+        manifest = pd.read_csv(path / "input_manifest.csv")
+
+        if "injection_side" not in manifest.columns:
+            return (
+                False,
+                "input_manifest.csv 에 injection_side column 이 없음",
+                summary,
+            )
+
+    except (OSError, ValueError) as error:
+        return False, f"파일을 읽지 못함: {error}", summary
+
+    return True, "", summary
+
+
 _NAMESPACE_KEYS = [
     "RESULTS",
     "OVERVIEW",
@@ -835,7 +974,26 @@ def resolve_run_dir(run_dir=None):
             "지정해 주십시오."
         )
 
+        ok, reason, summary = check_run(resolved)
+
+        require(
+            ok,
+            f"지정하신 run 폴더는 이 분석에 쓸 수 없습니다:\n{resolved}\n"
+            f"  이유: {reason}\n"
+            f"  내용: {describe_run(summary)}"
+        )
+
+        print("Figure 1 run 폴더:")
+        print(f"  {resolved}")
+        print(f"  {describe_run(summary)}")
+
         return resolved
+
+    # ----------------------------------------------------
+    # 2. 노트북 변수
+    # ----------------------------------------------------
+
+    rejected = []
 
     for namespace in _namespaces():
 
@@ -846,45 +1004,103 @@ def resolve_run_dir(run_dir=None):
 
             resolved = _as_run_dir(namespace[key])
 
-            if resolved is not None:
+            if resolved is None:
+                continue
+
+            ok, reason, summary = check_run(resolved)
+
+            if ok:
 
                 print(f"Figure 1 run 폴더를 {key} 에서 찾았습니다:")
                 print(f"  {resolved}")
+                print(f"  {describe_run(summary)}")
 
                 return resolved
 
-    candidates = find_run_dirs()
+            rejected.append((resolved, f"{key} 변수 / {reason}"))
 
-    if candidates:
+    # ----------------------------------------------------
+    # 3. 파일 시스템 탐색
+    #
+    # 이름이 아니라 내용(cohort 구성, 필요한 파일)으로 거릅니다.
+    # ----------------------------------------------------
+
+    valid = []
+
+    for path in find_run_dirs():
+
+        ok, reason, summary = check_run(path)
+
+        if ok:
+            valid.append((path, summary))
+        else:
+            rejected.append((path, reason))
+
+    if len(valid) == 1:
+
+        path, summary = valid[0]
 
         print("Figure 1 run 폴더를 자동 탐색으로 찾았습니다:")
-        print(f"  {candidates[0]}")
+        print(f"  {path}")
+        print(f"  {describe_run(summary)}")
 
-        if len(candidates) > 1:
-
-            print("  (다른 후보)")
-
-            for path in candidates[1:5]:
-                print(f"    {path}")
-
+        if rejected:
             print(
-                "  다른 폴더를 쓰시려면 FIG1_RUN_DIR 에 지정해 주십시오."
+                f"  (조건에 맞지 않아 제외한 run {len(rejected)}개는 "
+                "diagnose() 로 확인하실 수 있습니다)"
             )
 
-        return candidates[0]
+        return path
 
-    raise ValueError(
-        "Figure 1 분석 폴더를 찾지 못했습니다.\n\n"
-        "확인한 변수: "
-        + ", ".join(_NAMESPACE_KEYS)
-        + "\n탐색한 폴더:\n  "
-        + "\n  ".join(str(root) for root in _search_roots())
-        + "\n탐색한 패턴: "
-        + ", ".join(_RUN_PATTERNS)
-        + "\n\n"
-        "FIG1_RUN_DIR 에 run_... 폴더 경로를 직접 지정하시거나, "
-        "SEARCH_ROOTS 에 SELECT_outputs 의 상위 폴더를 추가해 주십시오."
-    )
+    if len(valid) > 1:
+
+        lines = [
+            "이 분석에 쓸 수 있는 Figure 1 run 폴더가 여러 개입니다.",
+            "어느 것을 쓸지 자동으로 고르지 않겠습니다.",
+            "",
+            "FIG1_RUN_DIR 에 아래 중 하나를 지정해 주십시오 "
+            "(최근 순).",
+            "",
+        ]
+
+        for path, summary in valid:
+            lines.append(f'  FIG1_RUN_DIR = "{path}"')
+            lines.append(f"      {describe_run(summary)}")
+            lines.append("")
+
+        raise ValueError("\n".join(lines))
+
+    lines = [
+        "이 분석에 쓸 수 있는 Figure 1 run 폴더를 찾지 못했습니다.",
+        "",
+        "필요한 조건",
+        "  - RUN_STATUS.json 이 completed",
+        "  - " + ", ".join(REQUIRED_FILES),
+        "  - cohort 의 Cre group 에 "
+        + ", ".join(SOURCE_LABEL[s] for s in SOURCE_ORDER)
+        + " 가 모두 존재",
+        "",
+    ]
+
+    if rejected:
+
+        lines.append("확인했지만 제외된 run")
+
+        for path, reason in rejected[:12]:
+            lines.append(f"  {path}")
+            lines.append(f"      -> {reason}")
+
+        lines.append("")
+
+    lines += [
+        "탐색한 폴더",
+        *[f"  {root}" for root in _search_roots()],
+        "",
+        "FIG1_RUN_DIR 에 run_... 폴더를 직접 지정하시거나, "
+        "SEARCH_ROOTS 에 상위 폴더를 추가해 주십시오.",
+    ]
+
+    raise ValueError("\n".join(lines))
 
 
 def load_atlas(cfg):
@@ -3594,6 +3810,235 @@ def make_qc(ctx, tables, show=None):
 # RUN
 # ============================================================
 
+def diagnose(run_dir=None):
+    """
+    입력 상태만 점검하고 출력합니다. figure 는 만들지 않습니다.
+
+    오류가 날 때 이 출력을 그대로 보내 주시면 원인을 바로 알 수 있습니다.
+    """
+
+    print("==========================================")
+    print("DIAGNOSE")
+    print("==========================================")
+
+    # ----------------------------------------------------
+    # 1. 후보 run 폴더
+    # ----------------------------------------------------
+
+    print()
+    print("[1] 찾은 run 폴더")
+
+    try:
+
+        found = find_run_dirs()
+
+        if not found:
+            print("  없음")
+
+        for path in found:
+
+            ok, reason, summary = check_run(path)
+
+            print(f"  {'[사용 가능]' if ok else '[제외]    '} {path}")
+            print(f"      {describe_run(summary)}")
+
+            if not ok:
+                print(f"      -> {reason}")
+
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+    # ----------------------------------------------------
+    # 2. 선택된 run 폴더
+    # ----------------------------------------------------
+
+    print()
+    print("[2] 사용할 run 폴더")
+
+    run = None
+
+    try:
+        run = resolve_run_dir(run_dir)
+    except Exception as error:  # noqa: BLE001
+        print(f"  확정 실패: {error}")
+
+    if run is not None:
+
+        for name in REQUIRED_FILES:
+
+            path = run / name
+
+            if not path.is_file():
+                print(f"  없음: {name}")
+                continue
+
+            if name.endswith(".json"):
+                print(f"  {name}: 있음")
+                continue
+
+            try:
+                frame = pd.read_csv(path, nrows=5)
+                print(
+                    f"  {name}: {list(frame.columns)}"
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"  {name}: 읽기 실패 {error}")
+
+        try:
+
+            saved = json.loads(
+                (run / "config.json").read_text(encoding="utf-8")
+            )
+
+            atlas_path = Path(saved["config"]["atlas_path"]).expanduser()
+
+            print(
+                f"  atlas_path: {atlas_path} "
+                f"({'있음' if atlas_path.exists() else '없음'})"
+            )
+
+            print(
+                f"  Cre {SOURCE_LABEL[MATCHED_SOURCE]} mice: "
+                f"{saved['cohorts']['Cre'][MATCHED_SOURCE]}"
+            )
+
+        except Exception as error:  # noqa: BLE001
+            print(f"  config.json 확인 실패: {error}")
+
+        agm = (
+            run / "primary" / "AllGrayMatter" / MATCHED_SOURCE
+            / "feature_definitions.csv"
+        )
+
+        if agm.is_file():
+            try:
+                frame = pd.read_csv(agm, nrows=5)
+                print(f"  feature_definitions.csv: {list(frame.columns)}")
+            except Exception as error:  # noqa: BLE001
+                print(f"  feature_definitions.csv 읽기 실패: {error}")
+        else:
+            print("  feature_definitions.csv: 없음 "
+                  "(AllGrayMatter scope 는 건너뜁니다)")
+
+    # ----------------------------------------------------
+    # 3. reinjection 파일
+    # ----------------------------------------------------
+
+    print()
+    print("[3] reinjection 파일")
+
+    for mouse, root in REINJ_ROOTS.items():
+
+        print(f"  {mouse}: {root}")
+
+        results = Path(root).expanduser() / RESULTS_SUBDIR
+
+        if not results.is_dir():
+            print(f"    폴더 없음: {results}")
+            continue
+
+        for template, side in (
+            (RH_FILE_TEMPLATE, "rh"),
+            (WHOLE_FILE_TEMPLATE, "whole"),
+        ):
+
+            missing = [
+                level for level in LEVELS
+                if not (results / template.format(level=level)).is_file()
+            ]
+
+            if missing:
+                print(
+                    f"    {side}: lvl {missing} 파일 없음"
+                )
+
+            sample = results / template.format(level=LEVELS[0])
+
+            if sample.is_file():
+
+                try:
+
+                    frame = pd.read_csv(sample)
+
+                    print(
+                        f"    {side} lvl{LEVELS[0]}: "
+                        f"{len(frame)} rows, {list(frame.columns)}"
+                    )
+
+                except Exception as error:  # noqa: BLE001
+                    print(f"    {side} 읽기 실패: {error}")
+
+    # ----------------------------------------------------
+    # 4. 실제 로딩
+    # ----------------------------------------------------
+
+    print()
+    print("[4] 실제 로딩")
+
+    ctx = None
+    tables = None
+
+    try:
+        ctx = load_fig1(run)
+        print(f"  Figure 1: OK, Cre mice {len(ctx['cre_mice'])}")
+        print(f"  출력 폴더: {ctx['output']}")
+    except Exception:  # noqa: BLE001
+        print("  Figure 1 로딩 실패:")
+        traceback.print_exc()
+
+    try:
+        tables = load_reinj_tables()
+        for mouse, frame in tables.items():
+            print(
+                f"  {mouse}: {len(frame)} regions, "
+                f"total rh {frame['rh_count'].sum():.0f} / "
+                f"whole {frame['whole_count'].sum():.0f}"
+            )
+    except Exception:  # noqa: BLE001
+        print("  reinjection 로딩 실패:")
+        traceback.print_exc()
+
+    if ctx is not None and tables is not None:
+
+        try:
+
+            sets = region_sets(ctx)
+
+            for scope, frame in sets.items():
+
+                ids = frame["id"].tolist()
+
+                fig1_ids = set(ctx["raw"].id.astype(int))
+
+                reinj_ids = set.intersection(*[
+                    set(table.index.astype(int))
+                    for table in tables.values()
+                ])
+
+                print(
+                    f"  {scope}: {len(ids)} regions, "
+                    f"Figure 1 에 있음 {len(set(ids) & fig1_ids)}, "
+                    f"reinjection 에 있음 {len(set(ids) & reinj_ids)}"
+                )
+
+                missing = sorted(set(ids) - reinj_ids)
+
+                if missing:
+                    print(
+                        f"      reinjection 파일에 없는 region id: "
+                        f"{missing[:20]}"
+                    )
+
+        except Exception:  # noqa: BLE001
+            print("  region set 확인 실패:")
+            traceback.print_exc()
+
+    print()
+    print("==========================================")
+
+    return dict(run=run, ctx=ctx, tables=tables)
+
+
 STEPS = [
     ("overview", make_overview),
     ("scatter", make_scatter),
@@ -3634,6 +4079,7 @@ def run_all(only=None, stop_on_error=False):
     print(f"Hemisphere: {HEMI_MODE} / orientation = {ORIENTATION}")
 
     results = {}
+    errors = {}
 
     for name, function in STEPS:
 
@@ -3647,25 +4093,48 @@ def run_all(only=None, stop_on_error=False):
 
         try:
             results[name] = function(ctx, tables)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             if stop_on_error:
                 raise
             print()
             print(f"[{name}] 실패:")
             traceback.print_exc()
             results[name] = None
+            errors[name] = error
 
     print()
     print("==========================================")
-    print("ALL DONE")
+    print("DONE")
     print("==========================================")
     print(ctx["output"])
     print()
 
-    for name, value in results.items():
-        print(f"{name}: {'ok' if value is not None else 'FAILED'}")
+    for name in results:
+        print(f"{name}: {'ok' if results[name] is not None else 'FAILED'}")
 
-    return dict(ctx=ctx, tables=tables, results=results)
+    if errors:
+
+        print()
+        print("실패 요약")
+
+        for name, error in errors.items():
+
+            first_line = str(error).strip().splitlines()
+
+            print(
+                f"  {name}: {type(error).__name__}: "
+                + (first_line[0] if first_line else "")
+            )
+
+        print()
+        print(
+            "원인을 확인하시려면 diagnose() 를 실행하고 그 출력을 "
+            "보내 주십시오."
+        )
+
+    return dict(
+        ctx=ctx, tables=tables, results=results, errors=errors
+    )
 
 
 if __name__ == "__main__":
