@@ -7,9 +7,21 @@
 에 해당하는 figure 코드입니다.
 
 **`reinj_all_in_one.py` 한 파일만 Jupyter cell 에 붙여 넣고 실행하면 됩니다.**
-파일 맨 위 SETTINGS 에서 `FIG1_RUN_DIR` 만 확인하시면 되고
-(기존 분석 직후면 `RESULTS["output"]` 을 자동으로 사용합니다),
 세 reinjection path 는 이미 들어 있습니다.
+
+Figure 1 run 폴더(`FIG1_RUN_DIR`)는 비워 두면 자동으로 찾습니다.
+
+1. 노트북에 남아 있는 기존 코드의 변수
+   (`RESULTS`, `OVERVIEW`, `SCATTER_RESULTS`, `HELLINGER_RESULTS`,
+   `RUN_DIR`, `SCATTER_RUN_DIR`, `HELLINGER_RUN_DIR`).
+   `Figure_list` 경로를 들고 있어도 옆의 `run_...` 을 찾습니다.
+2. `SEARCH_ROOTS` · reinjection path · 현재 폴더 · home 아래에서
+   `SELECT_outputs/run_*` 중 `RUN_STATUS.json` 이 completed 인 폴더를
+   탐색하여 가장 최근 것을 사용하고, 다른 후보도 함께 출력합니다.
+
+둘 다 실패하면 어떤 변수와 어떤 폴더를 찾아봤는지 출력하므로,
+`FIG1_RUN_DIR` 에 경로를 직접 적거나 `SEARCH_ROOTS` 에 상위 폴더를
+추가하시면 됩니다.
 
 Figure 포맷/스타일(Arial, SVG only, √p, source color, ρ·H 표기)은 기존
 Figure 1 코드들과 동일합니다.

@@ -78,13 +78,29 @@ REINJ_ROOTS = {
 
 
 # ------------------------------------------------------------
-# 2. Figure 1 분석 결과 폴더
+# 2. Figure 1 분석 결과 폴더 (run_... 폴더)
 #
-# 같은 notebook 에서 기존 분석 직후면 None 그대로 두세요.
-# RESULTS["output"] 을 자동으로 사용합니다.
+# None 이면 아래 순서로 자동으로 찾습니다.
+#
+#   1) 노트북에 남아 있는 기존 코드의 변수
+#      RESULTS / OVERVIEW / SCATTER_RESULTS / HELLINGER_RESULTS /
+#      RUN_DIR / SCATTER_RUN_DIR / HELLINGER_RUN_DIR
+#      (Figure_list 경로를 들고 있어도 옆의 run_... 을 찾습니다)
+#
+#   2) SEARCH_ROOTS 및 reinjection path, 현재 폴더, home 아래에서
+#      SELECT_outputs/run_* 중 완료된 폴더를 자동 탐색
+#      (여러 개면 가장 최근 것, 나머지는 후보로 출력)
+#
+# 특정 폴더를 쓰시려면 경로를 직접 적어 주십시오.
 # ------------------------------------------------------------
 
 FIG1_RUN_DIR = None
+
+
+# run_... 폴더를 찾을 상위 폴더를 추가하고 싶을 때 (선택)
+# 예: ["/data5/SELECT_outputs", "/data7/analysis"]
+
+SEARCH_ROOTS = []
 
 
 # ------------------------------------------------------------
@@ -574,24 +590,301 @@ def load_reinj_tables(roots=None):
 # Figure 1 결과 읽기
 # ============================================================
 
+def is_run_dir(path):
+    """config.json + RUN_STATUS.json 이 있는 완료된 run 폴더인가."""
+
+    try:
+        path = Path(path)
+    except TypeError:
+        return False
+
+    if not (path / "config.json").is_file():
+        return False
+
+    status_path = path / "RUN_STATUS.json"
+
+    if not status_path.is_file():
+        return False
+
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+
+    return status.get("status") == "completed"
+
+
+def _as_run_dir(value):
+    """
+    변수에서 얻은 경로를 run 폴더로 정규화합니다.
+
+    run 폴더 자체 / Figure_list 같은 형제 폴더 / 그 안의 파일
+    어느 쪽을 받아도 됩니다.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+
+        for key in ("output", "input_run", "run", "svg", "figure"):
+
+            found = _as_run_dir(value.get(key))
+
+            if found is not None:
+                return found
+
+        return None
+
+    if isinstance(value, (list, tuple)):
+
+        for item in value:
+
+            found = _as_run_dir(item)
+
+            if found is not None:
+                return found
+
+        return None
+
+    if not isinstance(value, (str, Path)):
+        return None
+
+    path = Path(value).expanduser()
+
+    if path.is_file():
+        path = path.parent
+
+    if not path.exists():
+        return None
+
+    path = path.resolve()
+
+    # 자기 자신 또는 부모 중 run 폴더
+    for candidate in [path, *path.parents]:
+
+        if is_run_dir(candidate):
+            return candidate
+
+    # 형제 폴더 (예: Figure_list 옆의 run_...)
+    for base in [path, path.parent]:
+
+        runs = sorted(
+            (child for child in base.glob("run_*") if is_run_dir(child)),
+            key=lambda p: p.stat().st_mtime,
+        )
+
+        if runs:
+            return runs[-1]
+
+    return None
+
+
+_NAMESPACE_KEYS = [
+    "RESULTS",
+    "OVERVIEW",
+    "SCATTER_RESULTS",
+    "HELLINGER_RESULTS",
+    "SOURCE_SPECIFICITY_FIGURE",
+    "RUN_DIR",
+    "SCATTER_RUN_DIR",
+    "HELLINGER_RUN_DIR",
+    "FIG1_RUN_DIR",
+]
+
+
+def _namespaces():
+    """노트북 / 호출자 / IPython namespace 를 모두 모읍니다."""
+
+    spaces = [globals()]
+
+    try:
+        import __main__
+        spaces.append(vars(__main__))
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        if shell is not None:
+            spaces.append(shell.user_ns)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        import inspect
+        frame = inspect.currentframe()
+        for _ in range(12):
+            frame = frame.f_back
+            if frame is None:
+                break
+            spaces.append(frame.f_globals)
+            spaces.append(frame.f_locals)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return spaces
+
+
+def _search_roots():
+    """run 폴더를 찾아볼 상위 폴더 후보."""
+
+    roots = []
+
+    for value in SEARCH_ROOTS:
+        roots.append(Path(value).expanduser())
+
+    for root in REINJ_ROOTS.values():
+
+        path = Path(root).expanduser()
+
+        roots.append(path)
+        roots.append(path.parent)
+
+    roots.append(Path.cwd())
+    roots.append(Path.home())
+
+    seen = set()
+    unique = []
+
+    for root in roots:
+
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+
+        if resolved in seen or not resolved.is_dir():
+            continue
+
+        seen.add(resolved)
+        unique.append(resolved)
+
+    return unique
+
+
+_RUN_PATTERNS = [
+    "run_*",
+    "SELECT_outputs/run_*",
+    "*/SELECT_outputs/run_*",
+    "*/*/SELECT_outputs/run_*",
+    "*/run_*",
+]
+
+
+def find_run_dirs(verbose=False):
+    """완료된 run 폴더를 파일 시스템에서 찾습니다 (최신 순)."""
+
+    found = {}
+
+    for root in _search_roots():
+
+        for pattern in _RUN_PATTERNS:
+
+            try:
+                matches = list(root.glob(pattern))
+            except OSError:
+                continue
+
+            for path in matches:
+
+                if not path.is_dir() or not is_run_dir(path):
+                    continue
+
+                resolved = path.resolve()
+
+                found[resolved] = resolved.stat().st_mtime
+
+                if verbose:
+                    print(f"  발견: {resolved}")
+
+    return [
+        path
+        for path, _ in sorted(
+            found.items(), key=lambda item: item[1], reverse=True
+        )
+    ]
+
+
 def resolve_run_dir(run_dir=None):
+    """
+    Figure 1 run 폴더를 찾습니다.
+
+    순서
+      1. 인자 또는 FIG1_RUN_DIR
+      2. 노트북에 남아 있는 기존 코드의 변수
+         (RESULTS, OVERVIEW, SCATTER_RESULTS, HELLINGER_RESULTS,
+          RUN_DIR, ...)
+      3. SELECT_outputs/run_* 폴더 자동 탐색
+    """
 
     if run_dir is None:
         run_dir = FIG1_RUN_DIR
 
-    if run_dir is None:
-        results = globals().get("RESULTS")
-        if isinstance(results, dict):
-            run_dir = results.get("output")
+    if run_dir is not None:
 
-    require(
-        run_dir is not None,
-        "Figure 1 분석 폴더를 찾을 수 없습니다.\n"
-        "FIG1_RUN_DIR 를 지정하거나 RESULTS['output'] 이 있는 "
-        "상태에서 실행하십시오."
+        path = Path(run_dir).expanduser().resolve()
+
+        resolved = _as_run_dir(path)
+
+        require(
+            resolved is not None,
+            f"지정하신 폴더가 완료된 Figure 1 run 폴더가 아닙니다:\n{path}\n"
+            "config.json / RUN_STATUS.json 이 있는 run_... 폴더를 "
+            "지정해 주십시오."
+        )
+
+        return resolved
+
+    for namespace in _namespaces():
+
+        for key in _NAMESPACE_KEYS:
+
+            if key not in namespace:
+                continue
+
+            resolved = _as_run_dir(namespace[key])
+
+            if resolved is not None:
+
+                print(f"Figure 1 run 폴더를 {key} 에서 찾았습니다:")
+                print(f"  {resolved}")
+
+                return resolved
+
+    candidates = find_run_dirs()
+
+    if candidates:
+
+        print("Figure 1 run 폴더를 자동 탐색으로 찾았습니다:")
+        print(f"  {candidates[0]}")
+
+        if len(candidates) > 1:
+
+            print("  (다른 후보)")
+
+            for path in candidates[1:5]:
+                print(f"    {path}")
+
+            print(
+                "  다른 폴더를 쓰시려면 FIG1_RUN_DIR 에 지정해 주십시오."
+            )
+
+        return candidates[0]
+
+    raise ValueError(
+        "Figure 1 분석 폴더를 찾지 못했습니다.\n\n"
+        "확인한 변수: "
+        + ", ".join(_NAMESPACE_KEYS)
+        + "\n탐색한 폴더:\n  "
+        + "\n  ".join(str(root) for root in _search_roots())
+        + "\n탐색한 패턴: "
+        + ", ".join(_RUN_PATTERNS)
+        + "\n\n"
+        "FIG1_RUN_DIR 에 run_... 폴더 경로를 직접 지정하시거나, "
+        "SEARCH_ROOTS 에 SELECT_outputs 의 상위 폴더를 추가해 주십시오."
     )
-
-    return Path(run_dir).expanduser().resolve()
 
 
 def load_atlas(cfg):
