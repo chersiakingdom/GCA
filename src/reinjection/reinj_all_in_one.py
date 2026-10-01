@@ -33,6 +33,7 @@
 from pathlib import Path
 from itertools import combinations
 import ast
+import copy
 import json
 import re
 import traceback
@@ -45,7 +46,10 @@ from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 
-import statsmodels.api as sm
+try:
+    import statsmodels.api as sm
+except ImportError:
+    sm = None
 
 
 # ============================================================
@@ -337,7 +341,10 @@ def to_p(density):
 
     require(
         np.isfinite(total).all() and (total > 0).all(),
-        "모든 feature 의 density 합이 0 인 mouse 가 있습니다."
+        "density 합이 0 이거나 유한하지 않은 mouse 가 있습니다: "
+        + ", ".join(
+            f"{mouse}={value:.4g}" for mouse, value in total.items()
+        )
     )
 
     p = density.div(total, axis=0)
@@ -1416,6 +1423,16 @@ def _read_feature_definitions(path):
 SPECIFICITY_SCOPE = "SourceSpecificity"
 
 
+# (scope, orientation) -> 해당 region set 에 tdT+ 세포가 0 개인 mouse
+NO_SIGNAL = {}
+
+NO_SIGNAL_PRINTED = set()
+
+
+class Skipped(Exception):
+    """필수가 아닌 단계를 건너뛸 때 (실패가 아님)."""
+
+
 def _space_paths(ctx, scope):
 
     if scope == SPECIFICITY_SCOPE:
@@ -1580,18 +1597,68 @@ def apply_features(tables, features, orientation=None):
     return count, area
 
 
+def coverage_report(tables, features, count, area, orientation=None):
+    """reinjection feature 의 count / area 상태를 사람이 읽을 수 있게 정리."""
+
+    lines = []
+
+    for mouse in count.index:
+
+        c = count.loc[mouse].astype(float)
+        a = area.loc[mouse].astype(float)
+
+        lines.append(
+            f"  {mouse}: feature {len(c)}개 | area>0 {int((a > AREA_ATOL).sum())} "
+            f"| count>0 {int((c > COUNT_ATOL).sum())} "
+            f"| count 합 {c.sum():.0f} | area 합 {a.sum():.4g}"
+        )
+
+    lines.append("")
+    lines.append("  예시 feature (raw 값 -> residual 값)")
+
+    for feature in list(features.index[:6]):
+
+        record = features.loc[feature]
+
+        side = reinj_side_for(record["hemisphere"], orientation)
+
+        rid = int(record["region_id"])
+
+        subtract = [int(i) for i in record["subtract_ids"]]
+
+        lines.append(
+            f"    {feature} ({record['label']}), {side}, "
+            f"subtract {len(subtract)}개"
+        )
+
+        for mouse, frame in tables.items():
+
+            raw_count = float(frame.at[rid, side + "_count"])
+            raw_area = float(frame.at[rid, side + "_area"])
+
+            lines.append(
+                f"      {mouse}: raw count {raw_count:.0f}, "
+                f"raw area {raw_area:.4g} -> residual count "
+                f"{float(count.at[mouse, feature]):.0f}, "
+                f"area {float(area.at[mouse, feature]):.4g}"
+            )
+
+    return "\n".join(lines)
+
+
 def reinj_p(tables, features, orientation=None):
 
     count, area = apply_features(tables, features, orientation)
 
     present = area > AREA_ATOL
 
-    require(
-        not ((count > COUNT_ATOL) & ~present).to_numpy().any(),
-        "reinjection: area=0 인 feature 에 count>0 이 있습니다."
-    )
+    bad = (count > COUNT_ATOL) & ~present
 
-    density = count.where(present) / area.where(present)
+    require(
+        not bad.to_numpy().any(),
+        "reinjection: area=0 인 feature 에 count>0 이 있습니다.\n"
+        + coverage_report(tables, features, count, area, orientation)
+    )
 
     valid = present.all(axis=0)
 
@@ -1599,9 +1666,42 @@ def reinj_p(tables, features, orientation=None):
         feature for feature in features.index if not valid[feature]
     ]
 
-    density = density.loc[:, valid]
+    kept = [feature for feature in features.index if valid[feature]]
 
-    return to_p(density), count, area, dropped
+    density = count.loc[:, kept] / area.loc[:, kept]
+
+    totals = density.sum(axis=1)
+
+    structural = len(kept) == 0 or not np.isfinite(totals).all()
+
+    if structural:
+
+        raise ValueError(
+            "reinjection p 를 계산할 수 없습니다 (area 문제).\n"
+            f"  feature {len(features)}개 중 모든 reinjection mouse 에서 "
+            f"area>0 인 것: {len(kept)}개 (제외 {len(dropped)}개)\n"
+            + "  mouse 별 density 합: "
+            + ", ".join(
+                f"{mouse}={value:.4g}" for mouse, value in totals.items()
+            )
+            + "\n\n"
+            + coverage_report(tables, features, count, area, orientation)
+        )
+
+    # 이 region set 에 tdT+ 세포가 하나도 없는 mouse 는 p 가 정의되지
+    # 않습니다. uniform map 으로 채우지 않고 이 scope 에서만 제외합니다.
+    no_signal = [mouse for mouse, value in totals.items() if value <= 0]
+
+    require(
+        len(no_signal) < len(totals),
+        "이 region set 에서 모든 reinjection mouse 의 tdT+ 세포 수가 "
+        "0 입니다.\n"
+        + coverage_report(tables, features, count, area, orientation)
+    )
+
+    density = density.loc[[m for m in density.index if m not in no_signal]]
+
+    return to_p(density), count, area, dropped, no_signal
 
 
 def common_feature_space(ctx, tables, scope, orientation=None):
@@ -1621,7 +1721,29 @@ def common_feature_space(ctx, tables, scope, orientation=None):
 
     p_fig1 = space["p"]
 
-    p_reinj, _, _, dropped = reinj_p(tables, features, orientation)
+    p_reinj, count, _, dropped, no_signal = reinj_p(
+        tables, features, orientation
+    )
+
+    key = (space["scope"], orientation or ORIENTATION)
+
+    for mouse in no_signal:
+
+        if (space["scope"], mouse) in NO_SIGNAL_PRINTED:
+            continue
+
+        NO_SIGNAL_PRINTED.add((space["scope"], mouse))
+
+        if True:
+
+            print(
+                f"  [{space['scope']}] {mouse}: 이 region set 안에 "
+                "tdT+ 세포가 0 개라 p 를 정의할 수 없어, 이 scope 의 "
+                "p 기반 분석에서만 제외합니다 "
+                f"(region set 전체 count = {float(count.loc[mouse].sum()):.0f})."
+            )
+
+    NO_SIGNAL[key] = list(no_signal)
 
     if dropped:
         print(
@@ -1785,7 +1907,14 @@ def make_overview(ctx, tables, show=None):
 
     for scope, space in feature_spaces(ctx).items():
 
-        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
+        try:
+            p_cre, p_reinj, features = common_feature_space(
+                ctx, tables, space
+            )
+        except ValueError as error:
+            print(f"  [{scope}] 이 scope 는 건너뜁니다:")
+            print("    " + str(error).replace("\n", "\n    "))
+            continue
 
         p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
 
@@ -1795,7 +1924,10 @@ def make_overview(ctx, tables, show=None):
             "mouse 가 없습니다."
         )
 
-        p_reinj = p_reinj.loc[reinj_mice]
+        missing = [m for m in reinj_mice if m not in p_reinj.index]
+
+        # 신호 없는 mouse 는 NaN 열 (회색) 로 남겨서 개체를 숨기지 않음
+        p_reinj = p_reinj.reindex(reinj_mice)
 
         slots = slot_of(features)
 
@@ -1839,7 +1971,7 @@ def make_overview(ctx, tables, show=None):
                 values = p.loc[mice, feature]
 
                 table.loc[region, mice] = values.to_numpy()
-                table.at[region, "Mean"] = float(values.mean())
+                table.at[region, "Mean"] = float(values.mean(skipna=True))
 
             return table
 
@@ -1910,7 +2042,7 @@ def make_overview(ctx, tables, show=None):
                 wspace=0.07,
             )
 
-            cmap = plt.get_cmap("viridis").copy()
+            cmap = copy.copy(plt.get_cmap("viridis"))
             cmap.set_bad("#E0E0E0")
 
             axes = {}
@@ -1975,9 +2107,16 @@ def make_overview(ctx, tables, show=None):
                     len(p_cre) if group == "Cre" else len(reinj_mice)
                 )
 
+                note = ""
+
+                if group == "Reinj" and missing:
+                    note = "\n" + ", ".join(
+                        f"Mouse {reinj_mice.index(m) + 1}" for m in missing
+                    ) + ": no tdT+ cells in this region set (gray)"
+
                 fig.text(
                     (left + right) / 2, 0.885,
-                    f"{GROUP_LABEL[group]}  (n = {n_mouse})",
+                    f"{GROUP_LABEL[group]}  (n = {n_mouse}){note}",
                     ha="center", va="center",
                     fontsize=12, fontfamily=RENDER_FONT,
                     fontweight="bold", color=color,
@@ -2059,7 +2198,7 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
 
     spaces = feature_spaces(ctx)
 
-    scopes = list(spaces)
+    scopes = []
 
     panels = {}
     point_records = []
@@ -2067,9 +2206,18 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
 
     for scope, space in spaces.items():
 
-        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
+        try:
+            p_cre, p_reinj, features = common_feature_space(
+                ctx, tables, space
+            )
+        except ValueError as error:
+            print(f"  [{scope}] 이 scope 는 건너뜁니다:")
+            print("    " + str(error).replace("\n", "\n    "))
+            continue
 
         p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
+
+        scopes.append(scope)
 
         slots = slot_of(features)
 
@@ -2084,16 +2232,35 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
         reference = p_cre.mean(axis=0)
 
         targets = [
-            (mouse, "individual", index, p_reinj.loc[mouse])
+            (
+                mouse, "individual", index,
+                p_reinj.loc[mouse] if mouse in p_reinj.index else None,
+            )
             for index, mouse in enumerate(reinj_mice)
         ]
 
         targets.append((
             "Mean", "mean", len(reinj_mice),
-            p_reinj.loc[reinj_mice].mean(axis=0),
+            p_reinj.mean(axis=0),
         ))
 
         for label, comparison, row, target in targets:
+
+            if target is None:
+
+                panels[(scope, row)] = dict(
+                    points=None,
+                    metric=dict(
+                        scope=scope, comparison=comparison,
+                        reinj_target=label, n_features=len(features),
+                        n_shown=0, spearman_rho=np.nan, hellinger=np.nan,
+                        no_signal=True,
+                    ),
+                )
+
+                metrics.append(panels[(scope, row)]["metric"])
+
+                continue
 
             a = reference.to_numpy(dtype=float)
             b = target.to_numpy(dtype=float)
@@ -2119,7 +2286,7 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
                 reinj_target=label,
                 n_Cre_mice=len(p_cre),
                 n_reinj_mice=(
-                    len(reinj_mice) if comparison == "mean" else 1
+                    len(p_reinj) if comparison == "mean" else 1
                 ),
                 n_features=len(features),
                 n_shown=int(keep.sum()),
@@ -2138,6 +2305,11 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
             metrics.append(metric)
 
             panels[(scope, row)] = dict(points=points, metric=metric)
+
+    require(
+        len(scopes) > 0,
+        "모든 scope 를 건너뛰었습니다. 위에 출력된 이유를 확인해 주십시오."
+    )
 
     points_df = pd.concat(point_records, ignore_index=True)
 
@@ -2211,6 +2383,34 @@ def make_scatter(ctx, tables, show=None, panel_inch=2.75):
                 ax.set_facecolor("#F7F7F7" if is_mean else "white")
 
                 limit = upper[scope]
+
+                if data is None:
+
+                    ax.set_xlim(0, 1)
+                    ax.set_ylim(0, 1)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+
+                    ax.set_aspect("equal", adjustable="box")
+
+                    ax.text(
+                        0.5, 0.5,
+                        "No tdT+ cells\nin this region set\n(p undefined)",
+                        ha="center", va="center",
+                        fontsize=9, color="#888888",
+                        fontfamily=RENDER_FONT,
+                    )
+
+                    for spine in ax.spines.values():
+                        spine.set_linewidth(0.65)
+                        spine.set_color("#C8C8C8")
+
+                    ax.set_title(
+                        f"Mouse {row + 1}",
+                        fontsize=9.5, fontfamily=RENDER_FONT, pad=5,
+                    )
+
+                    continue
 
                 ax.plot(
                     [0, limit], [0, limit], "--",
@@ -2334,7 +2534,7 @@ def make_hellinger(ctx, tables, show=None):
 
     spaces = feature_spaces(ctx)
 
-    scopes = list(spaces)
+    scopes = []
 
     records = []
     summary = []
@@ -2345,15 +2545,27 @@ def make_hellinger(ctx, tables, show=None):
 
     for scope, space in spaces.items():
 
-        p_cre, p_reinj, features = common_feature_space(ctx, tables, space)
+        try:
+            p_cre, p_reinj, features = common_feature_space(
+                ctx, tables, space
+            )
+        except ValueError as error:
+            print(f"  [{scope}] 이 scope 는 건너뜁니다:")
+            print("    " + str(error).replace("\n", "\n    "))
+            continue
 
         p_cre = p_cre.loc[[m for m in cre_mice if m in p_cre.index]]
+
+        scopes.append(scope)
 
         present_cre = list(p_cre.index)
 
         reference = p_cre.mean(axis=0)
 
         for number, mouse in enumerate(reinj_mice, start=1):
+
+            if mouse not in p_reinj.index:
+                continue
 
             records.append(dict(
                 scope=scope,
@@ -2397,7 +2609,7 @@ def make_hellinger(ctx, tables, show=None):
 
         flipped_mean = float(np.mean([
             hellinger(p_reinj_flipped.loc[mouse], reference)
-            for mouse in reinj_mice
+            for mouse in p_reinj_flipped.index
         ]))
 
         table = pd.DataFrame([r for r in records if r["scope"] == scope])
@@ -2428,7 +2640,15 @@ def make_hellinger(ctx, tables, show=None):
                 <= np.max(values["cre_pairwise"])
             )),
             reinj_mean_flipped_hemisphere=flipped_mean,
+            reinj_no_signal_mice=";".join(
+                m for m in reinj_mice if m not in p_reinj.index
+            ),
         ))
+
+    require(
+        len(scopes) > 0,
+        "모든 scope 를 건너뛰었습니다. 위에 출력된 이유를 확인해 주십시오."
+    )
 
     distance_df = pd.DataFrame(records)
     summary_df = pd.DataFrame(summary)
@@ -2536,9 +2756,14 @@ def make_hellinger(ctx, tables, show=None):
                 ax.spines[name].set_color("#A0A5A8")
                 ax.spines[name].set_linewidth(0.7)
 
+            no_signal_note = (
+                f", reinjection n = {int(row['n_reinj'])}"
+                if int(row["n_reinj"]) < len(reinj_mice) else ""
+            )
+
             ax.set_title(
                 SCOPE_LABEL.get(scope, scope)
-                + f"\n{int(row['n_features'])} features",
+                + f"\n{int(row['n_features'])} features{no_signal_note}",
                 fontsize=11, fontfamily=RENDER_FONT,
                 fontweight="bold", pad=8,
             )
@@ -2643,11 +2868,13 @@ def make_source_specificity(ctx, tables, show=None):
 
         references[source] = p_cre.loc[source_mice].mean(axis=0)
 
+    defined = [m for m in reinj_mice if m in p_reinj.index]
+
     matrix = pd.DataFrame(
-        index=reinj_mice, columns=SOURCE_ORDER, dtype=float
+        index=defined, columns=SOURCE_ORDER, dtype=float
     )
 
-    for mouse in reinj_mice:
+    for mouse in defined:
         for source in SOURCE_ORDER:
             matrix.at[mouse, source] = hellinger(
                 p_reinj.loc[mouse], references[source]
@@ -2655,7 +2882,9 @@ def make_source_specificity(ctx, tables, show=None):
 
     rows = []
 
-    for number, mouse in enumerate(reinj_mice, start=1):
+    for mouse in defined:
+
+        number = reinj_mice.index(mouse) + 1
 
         matched = float(matrix.at[mouse, MATCHED_SOURCE])
 
@@ -2691,7 +2920,7 @@ def make_source_specificity(ctx, tables, show=None):
         out / "Reinj_source_specificity_assignments.csv", index=False
     )
 
-    matrix.reset_index(names="mouse").to_csv(
+    matrix.rename_axis("mouse").reset_index().to_csv(
         out / "Reinj_source_specificity_hellinger.csv", index=False
     )
 
@@ -2731,7 +2960,8 @@ def make_source_specificity(ctx, tables, show=None):
         ax.set_yticks(range(len(matrix)))
 
         ax.set_yticklabels(
-            [f"Mouse {i + 1}" for i in range(len(matrix))], fontsize=9
+            [f"Mouse {reinj_mice.index(m) + 1}" for m in matrix.index],
+            fontsize=9,
         )
 
         ax.set_ylabel("EV reinjection mice", fontsize=10, labelpad=8)
@@ -3247,6 +3477,13 @@ def make_enrichment(ctx, tables, show=None):
 def make_reference_model(ctx, tables, show=None):
 
     out = ctx["output"]
+
+    if sm is None:
+        raise Skipped(
+            "statsmodels 가 설치되어 있지 않아 count model figure 를 "
+            "건너뜁니다. 필요하시면 %pip install statsmodels 후 "
+            "run_all(only=['reference_model']) 로 이 그림만 다시 그리시면 됩니다."
+        )
 
     space = load_feature_space(ctx, "AllGrayMatter")
 
@@ -4147,6 +4384,10 @@ def run_all(only=None, stop_on_error=False):
 
         try:
             results[name] = function(ctx, tables)
+        except Skipped as reason:
+            print(f"  SKIPPED: {reason}")
+            results[name] = "skipped"
+            continue
         except Exception as error:  # noqa: BLE001
             if stop_on_error:
                 raise
@@ -4163,8 +4404,35 @@ def run_all(only=None, stop_on_error=False):
     print(ctx["output"])
     print()
 
-    for name in results:
-        print(f"{name}: {'ok' if results[name] is not None else 'FAILED'}")
+    for name, value in results.items():
+        state = (
+            "SKIPPED" if isinstance(value, str) and value == "skipped"
+            else "ok" if value is not None
+            else "FAILED"
+        )
+        print(f"{name}: {state}")
+
+    no_signal_rows = [
+        dict(scope=scope, orientation=orientation, mouse=mouse)
+        for (scope, orientation), mice in NO_SIGNAL.items()
+        for mouse in mice
+    ]
+
+    if no_signal_rows:
+
+        frame = pd.DataFrame(no_signal_rows).drop_duplicates(
+            ["scope", "mouse"]
+        )
+
+        frame.to_csv(
+            ctx["output"] / "Reinj_no_signal_mice.csv", index=False
+        )
+
+        print()
+        print("region set 안에 tdT+ 세포가 0 개라 p 기반 분석에서 제외된 경우")
+
+        for row in frame.itertuples():
+            print(f"  {row.scope}: {row.mouse}")
 
     if errors:
 

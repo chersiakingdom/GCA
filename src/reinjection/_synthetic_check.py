@@ -21,6 +21,9 @@ import pandas as pd
 
 RNG = np.random.default_rng(7)
 
+# None 이면 모든 mouse 에 신호. 숫자면 그 mouse 는 M1 predefined 영역에 0개.
+ZERO_PREDEFINED_MOUSE = 2
+
 SOURCES = ["Motor", "dHP", "S1", "PFC"]
 
 DIVISIONS = [
@@ -469,6 +472,11 @@ def build(root):
         whole_leaf = pd.Series(
             RNG.poisson(noisy.to_numpy() * total), index=leaves
         ).astype(float)
+
+        # 실제 데이터에서 본 상황 재현:
+        # 2번 mouse 는 M1 predefined recipient region 에 세포가 0 개
+        if number == ZERO_PREDEFINED_MOUSE:
+            whole_leaf.loc[predefined["Motor"]] = 0.0
 
         rh_leaf = pd.Series(
             RNG.binomial(whole_leaf.astype(int), 0.5), index=leaves
