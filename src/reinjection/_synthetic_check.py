@@ -445,16 +445,14 @@ def main():
     import matplotlib
     matplotlib.use("Agg")
 
-    import reinj_config as C
+    import reinj_all_in_one as R
 
-    C.FIG1_RUN_DIR = str(run)
-    C.REINJ_ROOTS = reinj_roots
-    C.SHOW_FIGURES = False
-    C.N_PERMUTATION = 300
+    R.FIG1_RUN_DIR = str(run)
+    R.REINJ_ROOTS = reinj_roots
+    R.SHOW_FIGURES = False
+    R.N_PERMUTATION = 300
 
-    from run_all import run_all
-
-    run_all(stop_on_error=True)
+    R.run_all(stop_on_error=True)
 
 
 if __name__ == "__main__":
